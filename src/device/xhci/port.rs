@@ -80,6 +80,14 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
         }
         let is_suspended = self.portsc[port_id].is_suspended();
         if is_suspended != was_suspended {
+            debug!(
+                "root port {port_id} is {}",
+                if is_suspended {
+                    "suspended"
+                } else {
+                    "active again"
+                }
+            );
             // A hub on the port learns that the bus is suspended, or active again.
             self.msg_sender
                 .send(PortMessage::RootPortSuspended(port_id as u8, is_suspended))
@@ -316,10 +324,10 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         };
         self.portsc[root_port].set_suspend_supported(true);
         let portsc = self.portsc.clone();
-        hub.connect_to_root_port(move || {
-            if let Err(err) = portsc[root_port].remote_wakeup() {
-                warn!("could not wake root port {root_port}: {err}");
-            }
+        hub.connect_to_root_port(move || match portsc[root_port].remote_wakeup() {
+            Ok(true) => debug!("root port {root_port} is resumed by the hub on it"),
+            Ok(false) => {}
+            Err(err) => warn!("could not wake root port {root_port}: {err}"),
         });
     }
 
