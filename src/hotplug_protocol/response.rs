@@ -4,8 +4,10 @@ use std::{
     os::unix::net::UnixStream,
 };
 
+use serde::{Deserialize, Serialize};
+
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Response {
     SuccessfulOperation,
     ListFollowing,
@@ -14,6 +16,17 @@ pub enum Response {
     FailedToOpenFd,
     NoSuchDevice,
     Invalid,
+    /// A device is attached at this port path already.
+    PathOccupied,
+    /// The root port or the hub that the path names does not exist, or the hub has no such port.
+    NoSuchPath,
+    /// The path leads through a device that is not a hub.
+    NotAHub,
+    /// The port does not take the device: a SuperSpeed device on a USB 2 port, or a high speed
+    /// device below a full speed hub.
+    SpeedNotSupported,
+    /// The description of the device is wrong.
+    InvalidRequest,
 }
 
 impl Response {
@@ -90,6 +103,11 @@ impl TryFrom<u8> for Response {
             3 => Self::CouldNotDetermineSpeed,
             4 => Self::FailedToOpenFd,
             5 => Self::NoSuchDevice,
+            7 => Self::PathOccupied,
+            8 => Self::NoSuchPath,
+            9 => Self::NotAHub,
+            10 => Self::SpeedNotSupported,
+            11 => Self::InvalidRequest,
             _ => Self::Invalid,
         })
     }
