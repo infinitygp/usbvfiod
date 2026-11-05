@@ -66,7 +66,9 @@ high speed device below a full speed hub), `InvalidRequest` (a wrong hub descrip
 
 ## The protocol of the hotplug socket
 
-The three-byte commands `attach`, `detach` and `list` and their one-byte replies are unchanged.
+`usbvfiod` serves one client at a time. It gives the client 5 seconds to send the whole command,
+and 5 seconds to accept the reply. The three-byte commands `attach`, `detach` and `list` and their one-byte replies
+are unchanged.
 The new commands start with a command byte of the range 0x10 to 0x15, followed by the length of
 the payload as 32-bit little endian number and the payload as JSON. `attach-at` carries the file
 descriptor of the device like `attach`, and the command 0x15 carries one end of a socket. The reply is a 32-bit little endian length and a JSON

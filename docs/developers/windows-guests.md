@@ -26,9 +26,12 @@ Most of this holds for every guest, but Windows is the first driver that exercis
 - During a stop it writes `PORTSC.PLS = U3` with `LWS` set to the ports. The write is ignored and
   the link state does not change, except for a USB 2 port with a hub on it (see below).
 - A Stop Endpoint command on an endpoint with a pending transfer is answered by a Transfer Event
-  with the completion code Stopped for the TRB, before the completion of the command. Without it,
-  Windows waits 2 seconds before it goes on. It stops the status change endpoint of an idle hub
-  this way when it suspends the hub.
+  with the completion code Stopped, before the completion of the command. Without it, Windows
+  waits 2 seconds before it goes on. It stops the status change endpoint of an idle hub this way
+  when it suspends the hub. The controller collects all TRBs of a TD before it talks to the device,
+  so a stop abandons the whole TD: the event names the first TRB of the TD with its full length
+  as the residual (the length is not valid for a TRB that moves no data), the dequeue pointer of
+  the endpoint context points to that TRB, and the TD starts over when the endpoint continues.
 - Windows suspends hubs that have no active device, and relies on the remote wakeup of the hub to
   learn about a device that is plugged in later (see [Hubs and Port Paths](../users/hubs.md)). When
   the whole tree is idle, it suspends the root port of the top hub with `PORTSC.PLS = U3`. A USB 2 root
