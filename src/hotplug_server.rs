@@ -7,7 +7,7 @@ use std::{
         unix::net::{UnixListener, UnixStream},
     },
     sync::atomic::{AtomicU32, Ordering},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -45,12 +45,23 @@ pub fn run_hotplug_server(
     hotplug_control: HotplugControl<ControllerDevice>,
     async_runtime: runtime::Handle,
 ) {
+    serve(socket, hotplug_control, async_runtime, COMMAND_TIMEOUT);
+}
+
+/// Handle the clients one after the other. A client has `timeout` for all of its command.
+fn serve(
+    socket: UnixListener,
+    hotplug_control: HotplugControl<ControllerDevice>,
+    async_runtime: runtime::Handle,
+    timeout: Duration,
+) {
     loop {
         if let Ok((mut stream, _addr)) = socket.accept() {
-            if let Err(e) = stream.set_read_timeout(Some(COMMAND_TIMEOUT)) {
-                warn!("Could not set a timeout for reading a hotplug command: {e}");
+            // The reply is small, but a client that does not read it must not hold the server.
+            if let Err(e) = stream.set_write_timeout(Some(timeout)) {
+                warn!("Could not set a timeout for writing a hotplug reply: {e}");
             }
-            match Command::receive_from_socket(&stream) {
+            match Command::receive_from_socket_before(&stream, Instant::now() + timeout) {
                 Ok(command) => {
                     debug!("Received command {:?} on hotplug socket", command);
                     if let Err(e) =
@@ -350,6 +361,10 @@ mod tests {
 
     impl TestServer {
         fn start(name: &str) -> Self {
+            Self::start_with_timeout(name, COMMAND_TIMEOUT)
+        }
+
+        fn start_with_timeout(name: &str, timeout: Duration) -> Self {
             let path = std::env::temp_dir()
                 .join(format!("usbvfiod-hotplug-{}-{name}", std::process::id()));
             let _ = std::fs::remove_file(&path);
@@ -360,7 +375,7 @@ mod tests {
             // The server runs for the rest of the process, like the controller behind it.
             thread::spawn(move || {
                 let _backend = backend;
-                run_hotplug_server(socket, control, handle);
+                serve(socket, control, handle, timeout);
             });
             Self { path }
         }
@@ -687,6 +702,40 @@ mod tests {
         });
         assert_eq!(reply.response, Response::FailedToOpenFd, "{reply:?}");
         assert_eq!(tree_paths(&server), ["5", "5.1"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_that_sends_a_command_slowly_does_not_hold_the_server() {
+        use std::io::Write;
+
+        let server = TestServer::start_with_timeout("slow", Duration::from_millis(300));
+
+        // A command that announces a long payload and gets a byte every 50 ms, which is faster than
+        // any timeout of a single read.
+        let mut slow = server.connect();
+        let trickle = thread::spawn(move || {
+            let mut frame = vec![0x13];
+            frame.extend(1000u32.to_le_bytes());
+            if slow.write_all(&frame).is_err() {
+                return;
+            }
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(50));
+                if slow.write_all(b" ").is_err() {
+                    return;
+                }
+            }
+        });
+
+        // Another client is served long before the first one is done.
+        let mut socket = server.connect();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        Command::Tree.send_over_socket(&socket).unwrap();
+        let reply = Reply::receive_from_socket(&mut socket).expect("the server answers");
+        assert_eq!(reply.response, Response::SuccessfulOperation);
+        trickle.join().unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

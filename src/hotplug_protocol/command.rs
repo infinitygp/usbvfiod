@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
+use std::time::Instant;
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use vmm_sys_util::errno::Error;
@@ -188,14 +189,33 @@ impl Command {
     }
 
     pub fn receive_from_socket(socket: &UnixStream) -> Result<Self, CommandReceiveError> {
+        Self::receive(socket, None)
+    }
+
+    /// Like [`Self::receive_from_socket`], but the whole command has to arrive before the
+    /// deadline. A peer that sends a byte now and then does not get more time for it.
+    ///
+    /// This sets the read timeout of the socket.
+    pub fn receive_from_socket_before(
+        socket: &UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, CommandReceiveError> {
+        Self::receive(socket, Some(deadline))
+    }
+
+    fn receive(
+        socket: &UnixStream,
+        deadline: Option<Instant>,
+    ) -> Result<Self, CommandReceiveError> {
         // The file descriptor arrives with the first byte of the message, so read the command alone
         // first and decide from it how much follows.
         let mut id = [0u8; 1];
+        limit_wait(socket, deadline)?;
         let (bytes_read, file) = socket.recv_with_fd(&mut id[..])?;
         if bytes_read != id.len() {
             return Err(CommandReceiveError::NotEnoughData(id.len(), bytes_read));
         }
-        let mut reader = socket;
+        let mut reader = DeadlineReader { socket, deadline };
 
         match (id[0], file) {
             (COMMAND_ATTACH | COMMAND_DETACH | COMMAND_LIST, file) => {
@@ -288,8 +308,38 @@ impl Command {
     }
 }
 
+/// Allow the next read from the socket the time until the deadline.
+fn limit_wait(socket: &UnixStream, deadline: Option<Instant>) -> io::Result<()> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "the command did not arrive in time",
+                )
+            })?;
+        socket.set_read_timeout(Some(remaining))?;
+    }
+    Ok(())
+}
+
+/// A socket that is read until the deadline, however the data is cut into pieces.
+struct DeadlineReader<'a> {
+    socket: &'a UnixStream,
+    deadline: Option<Instant>,
+}
+
+impl Read for DeadlineReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        limit_wait(self.socket, self.deadline)?;
+        self.socket.read(buf)
+    }
+}
+
 /// Read the length and the payload of a framed command.
-fn read_payload(reader: &mut &UnixStream) -> Result<Vec<u8>, CommandReceiveError> {
+fn read_payload(reader: &mut impl Read) -> Result<Vec<u8>, CommandReceiveError> {
     let mut length = [0u8; 4];
     reader.read_exact(&mut length)?;
     let length = u32::from_le_bytes(length);
@@ -565,6 +615,50 @@ mod tests {
             Command::receive_from_socket(&server),
             Err(CommandReceiveError::UnexpectedFd)
         ));
+    }
+
+    #[test]
+    fn a_command_that_trickles_in_is_cut_off_at_the_deadline() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let trickle = std::thread::spawn(move || {
+            let mut frame = vec![COMMAND_DETACH_AT];
+            frame.extend(1000u32.to_le_bytes());
+            let _ = client.write_all(&frame);
+            // A byte every 20 ms is quicker than the time that a single read is given.
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                if client.write_all(b" ").is_err() {
+                    return;
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let result = Command::receive_from_socket_before(
+            &server,
+            Instant::now() + std::time::Duration::from_millis(200),
+        );
+
+        assert!(matches!(result, Err(CommandReceiveError::Io(_))));
+        assert!(started.elapsed() < std::time::Duration::from_millis(1500));
+        drop(server);
+        trickle.join().unwrap();
+    }
+
+    #[test]
+    fn a_command_that_arrives_in_time_is_received_with_the_deadline() {
+        let (client, server) = UnixStream::pair().unwrap();
+        Command::DetachAt { path: path("5.1") }
+            .send_over_socket(&client)
+            .unwrap();
+
+        let command = Command::receive_from_socket_before(
+            &server,
+            Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+
+        assert!(matches!(command, Command::DetachAt { path: p } if p == path("5.1")));
     }
 
     #[test]
