@@ -30,6 +30,7 @@ use crate::device::{
 #[derive(Debug)]
 pub struct CommandRing {
     running: Arc<AtomicBool>,
+    usbcmd: Arc<AtomicU32>,
     sender_to_worker: mpsc::UnboundedSender<WorkerMessage>,
 }
 
@@ -100,7 +101,7 @@ impl CommandRing {
             state: WorkerState::Stopped,
             receiver,
             commandring_running: running.clone(),
-            usbcmd,
+            usbcmd: usbcmd.clone(),
             event_sender,
             ring,
             slot_handle,
@@ -109,8 +110,17 @@ impl CommandRing {
 
         Self {
             running,
+            usbcmd,
             sender_to_worker,
         }
+    }
+
+    /// Whether the command ring counts as running (CRCR.CRR).
+    ///
+    /// Clearing USBCMD.RS stops the command ring, even if the worker has not noticed yet.
+    fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+            && (self.usbcmd.load(Ordering::Relaxed) as u64 & usbcmd::RS) == usbcmd::RS
     }
 
     pub fn doorbell(&self) -> anyhow::Result<()> {
@@ -128,7 +138,7 @@ impl CommandRing {
     ///
     /// - `value`: the value the driver wrote to the CRCR register
     pub fn control(&self, value: u64) -> anyhow::Result<()> {
-        if self.running.load(Ordering::Relaxed) {
+        if self.is_running() {
             match value {
                 abort if abort & crcr::CA != 0 => self.send_to_worker(WorkerMessage::Stop)?,
                 stop if stop & crcr::CS != 0 => self.send_to_worker(WorkerMessage::Stop)?,
@@ -156,7 +166,7 @@ impl CommandRing {
     /// All bits are zero except the CRR bit, which indicates whether the
     /// command ring is running.
     pub fn status(&self) -> u64 {
-        if self.running.load(Ordering::Relaxed) {
+        if self.is_running() {
             crcr::CRR
         } else {
             0
@@ -221,7 +231,9 @@ impl CommandWorker {
                         self.state = WorkerState::LookingForNewCommand;
                     }
                     WorkerMessage::Stop => self.state = WorkerState::Stopping,
-                    msg => warn!("Unexpected message: msg={msg:?}, state={:?}", self.state),
+                    WorkerMessage::SetDequeuePointerAndCS(dp, cs) => {
+                        self.restart_with_new_ring(dp, cs);
+                    }
                 },
                 WorkerState::LookingForNewCommand => {
                     // consume potential messages
@@ -245,7 +257,10 @@ impl CommandWorker {
                                 self.state = WorkerState::Stopping;
                                 continue 'run_loop;
                             }
-                            msg => warn!("Unexpected message: msg={msg:?}, state={:?}", self.state),
+                            WorkerMessage::SetDequeuePointerAndCS(dp, cs) => {
+                                self.restart_with_new_ring(dp, cs);
+                                continue 'run_loop;
+                            }
                         }
                     }
                     let controller_stopped =
@@ -285,6 +300,17 @@ impl CommandWorker {
                 }
             }
         }
+    }
+
+    /// Take new ring parameters while the ring is not stopped yet.
+    ///
+    /// The driver only writes them after it cleared USBCMD.RS, which stops the command ring as
+    /// well, and it sets up the ring for the next run.
+    fn restart_with_new_ring(&mut self, dequeue_pointer: u64, cycle_state: bool) {
+        debug!("Updating command ring parameters: dp={dequeue_pointer:#x}, cs={cycle_state}");
+        self.commandring_running.store(false, Ordering::Relaxed);
+        self.ring.set_dequeue_pointer(dequeue_pointer, cycle_state);
+        self.state = WorkerState::Stopped;
     }
 
     async fn next_msg(&mut self) -> anyhow::Result<WorkerMessage> {
@@ -390,7 +416,15 @@ impl CommandWorker {
                     data.slot_id,
                 )
             }
-            CommandTrbVariant::ForceHeader => todo!(),
+            CommandTrbVariant::ForceHeader => {
+                warn!("Force Header commands are not supported");
+                EventTrb::new_command_completion_event_trb(
+                    trb.address,
+                    0,
+                    CompletionCode::TrbError,
+                    0,
+                )
+            }
             CommandTrbVariant::NoOp => EventTrb::new_command_completion_event_trb(
                 trb.address,
                 0,
@@ -656,6 +690,55 @@ mod tests {
 
         assert_eq!(command_ring.status(), crcr::CRR);
         assert!(interrupter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn clearing_run_stop_stops_the_ring_and_a_new_dequeue_pointer_takes_effect() {
+        let (command_ring, mut interrupter, _receiver, dma_bus, usbcmd) = init_test();
+
+        // Where the ring continues after the driver sets it up again.
+        const NEW_ADDRESS: u64 = 0x800;
+
+        for address in [FIRST_ADDRESS, NEW_ADDRESS] {
+            let command = RawTrbBuilder::new(address)
+                .with_trb_type(trb_types::NO_OP_COMMAND)
+                .build();
+            dma_bus.write_bulk(command.address, &command.buffer);
+        }
+
+        usbcmd.write(usbcmd::RS);
+        command_ring.doorbell().unwrap();
+        let event = interrupter.await_event().await.unwrap();
+        assert_eq!(
+            event,
+            EventTrb::new_command_completion_event_trb(
+                FIRST_ADDRESS,
+                0,
+                CompletionCode::Success,
+                SLOT_ID
+            )
+        );
+        assert_eq!(command_ring.status(), crcr::CRR);
+
+        // The driver stops the controller without a Host Controller Reset.
+        usbcmd.write(0);
+        assert_eq!(command_ring.status() & crcr::CRR, 0);
+
+        command_ring.control(NEW_ADDRESS).unwrap();
+        usbcmd.write(usbcmd::RS);
+        command_ring.doorbell().unwrap();
+
+        let event = interrupter.await_event().await.unwrap();
+        assert_eq!(
+            event,
+            EventTrb::new_command_completion_event_trb(
+                NEW_ADDRESS,
+                0,
+                CompletionCode::Success,
+                SLOT_ID
+            )
+        );
+        assert_eq!(command_ring.status(), crcr::CRR);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
