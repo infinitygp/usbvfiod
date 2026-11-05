@@ -17,7 +17,10 @@ use nusb::{
     },
     Endpoint, ErrorKind, Interface, MaybeFuture,
 };
-use tokio::{runtime, select, sync::mpsc};
+use tokio::{
+    runtime, select,
+    sync::{mpsc, watch},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -197,12 +200,24 @@ impl RealDevice for NusbRealDevice {
     }
 }
 
+/// A request for the worker, with its number.
+type NumberedRequest = (u64, UsbRequest);
+
+/// The worker's answer to a request with its number; none for a request it gave up.
+type NumberedAnswer = (u64, Option<ControlRequestProcessingResult>);
+
 #[derive(Debug)]
 pub struct ControlEndpointHandle {
     // signal worker to stop
     cancel: CancellationToken,
-    request_submitter: mpsc::UnboundedSender<UsbRequest>,
-    response_receiver: mpsc::UnboundedReceiver<ControlRequestProcessingResult>,
+    request_submitter: mpsc::UnboundedSender<NumberedRequest>,
+    response_receiver: mpsc::UnboundedReceiver<NumberedAnswer>,
+    /// The worker gives up the requests up to this number.
+    abort: watch::Sender<u64>,
+    /// The number of the last request submitted.
+    submitted: u64,
+    /// The number of the last request the worker answered or gave up.
+    answered: u64,
 }
 
 impl Drop for ControlEndpointHandle {
@@ -216,19 +231,25 @@ impl RealControlEndpointHandle for ControlEndpointHandle {
         Pin<Box<dyn Future<Output = anyhow::Result<ControlRequestProcessingResult>> + Send + 'a>>;
 
     fn submit_control_request(&mut self, request: UsbRequest) -> anyhow::Result<()> {
-        self.request_submitter.send(request)?;
+        self.submitted += 1;
+        self.request_submitter.send((self.submitted, request))?;
 
         Ok(())
     }
 
     fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
         Box::pin(async {
-            let result = (self.response_receiver.recv().await)
-                // background worker is dead and has dropped the response sender
-                // maybe we want to error here instead
-                .unwrap_or(ControlRequestProcessingResult::TransactionError);
-
-            Ok(result)
+            loop {
+                let Some((number, result)) = self.response_receiver.recv().await else {
+                    // background worker is dead and has dropped the response sender
+                    return Ok(ControlRequestProcessingResult::TransactionError);
+                };
+                self.answered = number;
+                // The answer to a request that was given up is not the answer to this one.
+                if number == self.submitted {
+                    return Ok(result.unwrap_or(ControlRequestProcessingResult::TransactionError));
+                }
+            }
         })
     }
 }
@@ -236,42 +257,93 @@ impl RealControlEndpointHandle for ControlEndpointHandle {
 impl BaseEndpointHandle for ControlEndpointHandle {
     type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
+    /// The guest stopped the endpoint: the transfer on the device is cancelled, as an xHCI
+    /// controller aborts it.
     fn cancel(&mut self) -> Self::CompletionFuture<'_> {
-        // nothing we can do
-        Box::pin(async { Ok(()) })
+        Box::pin(async {
+            if self.answered < self.submitted {
+                self.abort.send_replace(self.submitted);
+                // The device is done with the request once the worker answered or gave it up.
+                while let Some((number, _)) = self.response_receiver.recv().await {
+                    self.answered = number;
+                    if number >= self.submitted {
+                        break;
+                    }
+                }
+            }
+            Ok(())
+        })
     }
 }
 
 impl ControlEndpointHandle {
     fn new(device_wrapper: Arc<NusbDeviceWrapper>, async_runtime: &runtime::Handle) -> Self {
+        Self::with_performer(
+            move |request| perform_control_request(device_wrapper.clone(), request),
+            async_runtime,
+        )
+    }
+
+    /// A handle whose worker carries out a request with `perform`.
+    fn with_performer<F, Fut>(perform: F, async_runtime: &runtime::Handle) -> Self
+    where
+        F: FnMut(UsbRequest) -> Fut + Send + 'static,
+        Fut: Future<Output = ControlRequestProcessingResult> + Send + 'static,
+    {
         let (request_submitter, request_receiver) = mpsc::unbounded_channel();
         let (response_submitter, response_receiver) = mpsc::unbounded_channel();
+        let (abort, abort_receiver) = watch::channel(0);
         let cancel = CancellationToken::new();
 
-        async_runtime.spawn(cancellable_control_endpoint_worker(
-            device_wrapper,
+        let worker = control_endpoint_worker(
+            perform,
             request_receiver,
             response_submitter,
-            cancel.clone(),
-        ));
+            abort_receiver,
+        );
+        let stop = cancel.clone();
+        async_runtime.spawn(async move {
+            select! {
+                () = worker => {},
+                () = stop.cancelled() => {},
+            }
+        });
 
         Self {
             cancel,
             request_submitter,
             response_receiver,
+            abort,
+            submitted: 0,
+            answered: 0,
         }
     }
 }
 
-async fn cancellable_control_endpoint_worker(
-    device_wrapper: Arc<NusbDeviceWrapper>,
-    request_receiver: mpsc::UnboundedReceiver<UsbRequest>,
-    response_submitter: mpsc::UnboundedSender<ControlRequestProcessingResult>,
-    cancel: CancellationToken,
-) {
-    select! {
-        _ = control_endpoint_worker(device_wrapper, request_receiver, response_submitter) => {},
-        _ = cancel.cancelled() => {},
+/// Carry out the requests one after the other, until the handle goes. A request that the handle
+/// gives up is dropped, which cancels its transfer on the device.
+async fn control_endpoint_worker<F, Fut>(
+    mut perform: F,
+    mut request_receiver: mpsc::UnboundedReceiver<NumberedRequest>,
+    response_submitter: mpsc::UnboundedSender<NumberedAnswer>,
+    mut abort: watch::Receiver<u64>,
+) where
+    F: FnMut(UsbRequest) -> Fut,
+    Fut: Future<Output = ControlRequestProcessingResult>,
+{
+    while let Some((number, request)) = request_receiver.recv().await {
+        let result = if *abort.borrow() >= number {
+            None
+        } else {
+            select! {
+                biased;
+                result = perform(request) => Some(result),
+                _ = abort.wait_for(|&given_up| given_up >= number) => None,
+            }
+        };
+        if response_submitter.send((number, result)).is_err() {
+            return;
+        }
     }
 }
 
@@ -279,76 +351,64 @@ async fn cancellable_control_endpoint_worker(
 const REQUEST_TYPE_STANDARD_INTERFACE_OUT: u8 = 0x01;
 const REQUEST_SET_INTERFACE: u8 = 0x0b;
 
-// this function can only return with an error, but ! cannot be used in Result
-async fn control_endpoint_worker(
-    device_wrapper: Arc<NusbDeviceWrapper>,
-    mut request_receiver: mpsc::UnboundedReceiver<UsbRequest>,
-    response_submitter: mpsc::UnboundedSender<ControlRequestProcessingResult>,
-) -> anyhow::Result<()> {
-    let device = &device_wrapper.device;
-    loop {
-        if let Some(request) = request_receiver.recv().await {
-            let (recipient, control_type) = extract_recipient_and_type(request.request_type);
-            let is_out_request = request.request_type & 0x80 == 0;
-            let is_set_interface = request.request_type == REQUEST_TYPE_STANDARD_INTERFACE_OUT
-                && request.request == REQUEST_SET_INTERFACE;
+/// An xHCI controller does not end a transfer by time: the guest's driver stops the endpoint
+/// when it gives up, which cancels the transfer. nusb takes this as a day.
+const NO_TIMEOUT: Duration = Duration::MAX;
 
-            let processing_result = match is_out_request {
-                // SET_INTERFACE must not be sent as a plain control transfer:
-                // neither the host kernel nor nusb would learn about the new
-                // alternate setting and its endpoints.
-                true if is_set_interface => {
-                    // wIndex holds the interface number and wValue the alternate setting.
-                    device_wrapper
-                        .set_alt_setting(request.index as u8, request.value as u8)
-                        .await
-                }
-                true => {
-                    let control = ControlOut {
-                        control_type,
-                        recipient,
-                        request: request.request,
-                        value: request.value,
-                        index: request.index,
-                        data: &request.data,
-                    };
-                    match device
-                        .control_out(control, Duration::from_millis(2000))
-                        .await
-                    {
-                        Ok(_) => ControlRequestProcessingResult::SuccessfulControlOut,
-                        Err(err) => map_error(err),
-                    }
-                }
-                false => {
-                    let length = match u16::try_from(request.length) {
-                        Ok(length) => length,
-                        Err(_) => {
-                            warn!("Control Transfer Request size larger than the nusb provided 16bit field size (data loss).");
-                            request.length as u16
-                        }
-                    };
-                    let control = ControlIn {
-                        control_type,
-                        recipient,
-                        request: request.request,
-                        value: request.value,
-                        index: request.index,
-                        length,
-                    };
-                    match device
-                        .control_in(control, Duration::from_millis(2000))
-                        .await
-                    {
-                        Ok(data) => ControlRequestProcessingResult::SuccessfulControlIn(data),
-                        Err(err) => map_error(err),
-                    }
+async fn perform_control_request(
+    device_wrapper: Arc<NusbDeviceWrapper>,
+    request: UsbRequest,
+) -> ControlRequestProcessingResult {
+    let device = &device_wrapper.device;
+    let (recipient, control_type) = extract_recipient_and_type(request.request_type);
+    let is_out_request = request.request_type & 0x80 == 0;
+    let is_set_interface = request.request_type == REQUEST_TYPE_STANDARD_INTERFACE_OUT
+        && request.request == REQUEST_SET_INTERFACE;
+
+    match is_out_request {
+        // SET_INTERFACE must not be sent as a plain control transfer:
+        // neither the host kernel nor nusb would learn about the new
+        // alternate setting and its endpoints.
+        true if is_set_interface => {
+            // wIndex holds the interface number and wValue the alternate setting.
+            device_wrapper
+                .set_alt_setting(request.index as u8, request.value as u8)
+                .await
+        }
+        true => {
+            let control = ControlOut {
+                control_type,
+                recipient,
+                request: request.request,
+                value: request.value,
+                index: request.index,
+                data: &request.data,
+            };
+            match device.control_out(control, NO_TIMEOUT).await {
+                Ok(_) => ControlRequestProcessingResult::SuccessfulControlOut,
+                Err(err) => map_error(err),
+            }
+        }
+        false => {
+            let length = match u16::try_from(request.length) {
+                Ok(length) => length,
+                Err(_) => {
+                    warn!("Control Transfer Request size larger than the nusb provided 16bit field size (data loss).");
+                    request.length as u16
                 }
             };
-
-            response_submitter.send(processing_result)?;
-        } else {
-            return Err(anyhow!("Sender closed the channel for control requests"));
+            let control = ControlIn {
+                control_type,
+                recipient,
+                request: request.request,
+                value: request.value,
+                index: request.index,
+                length,
+            };
+            match device.control_in(control, NO_TIMEOUT).await {
+                Ok(data) => ControlRequestProcessingResult::SuccessfulControlIn(data),
+                Err(err) => map_error(err),
+            }
         }
     }
 }
@@ -541,5 +601,109 @@ impl From<nusb::Speed> for Speed {
             nusb::Speed::SuperPlus => Self::SuperPlus,
             _ => todo!("new USB speed was added to non-exhaustive enum"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicBool;
+
+    use tokio::time::timeout;
+
+    use super::*;
+
+    /// Sets its flag when the transfer it is part of is dropped, which cancels it on the device.
+    struct Dropped(Arc<AtomicBool>);
+
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn request(value: u16) -> UsbRequest {
+        UsbRequest {
+            request_type: 0x80,
+            request: 6,
+            value,
+            length: 255,
+            ..UsbRequest::default()
+        }
+    }
+
+    type Answer = Pin<Box<dyn Future<Output = ControlRequestProcessingResult> + Send>>;
+
+    /// A device that never answers the request with wValue 0x0303 and answers others with the
+    /// low byte of their wValue.
+    fn hanging_device(cancelled: Arc<AtomicBool>) -> impl FnMut(UsbRequest) -> Answer {
+        move |request| {
+            let dropped = Dropped(cancelled.clone());
+            Box::pin(async move {
+                if request.value == 0x0303 {
+                    let _dropped = dropped;
+                    std::future::pending::<()>().await;
+                }
+                ControlRequestProcessingResult::SuccessfulControlIn(vec![request.value as u8])
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_control_transfer_lasts_until_the_guest_stops_the_endpoint_and_is_then_cancelled() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut handle = ControlEndpointHandle::with_performer(
+            hanging_device(cancelled.clone()),
+            &runtime::Handle::current(),
+        );
+
+        handle.submit_control_request(request(0x0303)).unwrap();
+        // No time limit of its own: an hour later the transfer is still on.
+        timeout(Duration::from_secs(3600), handle.next_completion())
+            .await
+            .unwrap_err();
+        assert!(!cancelled.load(Ordering::SeqCst));
+
+        handle.cancel().await.unwrap();
+        assert!(cancelled.load(Ordering::SeqCst));
+
+        // The next request gets its own answer.
+        handle.submit_control_request(request(0x0300)).unwrap();
+        assert!(matches!(
+            handle.next_completion().await.unwrap(),
+            ControlRequestProcessingResult::SuccessfulControlIn(data) if data == [0x00]
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_answer_to_a_request_given_up_does_not_answer_the_next_one() {
+        let mut handle = ControlEndpointHandle::with_performer(
+            hanging_device(Arc::new(AtomicBool::new(false))),
+            &runtime::Handle::current(),
+        );
+
+        // The device answers, but the guest stops the endpoint before it takes the answer.
+        handle.submit_control_request(request(0x0301)).unwrap();
+        handle.cancel().await.unwrap();
+
+        handle.submit_control_request(request(0x0302)).unwrap();
+        assert!(matches!(
+            handle.next_completion().await.unwrap(),
+            ControlRequestProcessingResult::SuccessfulControlIn(data) if data == [0x02]
+        ));
+    }
+
+    #[tokio::test]
+    async fn stopping_an_endpoint_without_a_request_on_it_does_nothing() {
+        let mut handle = ControlEndpointHandle::with_performer(
+            hanging_device(Arc::new(AtomicBool::new(false))),
+            &runtime::Handle::current(),
+        );
+        handle.cancel().await.unwrap();
+
+        handle.submit_control_request(request(0x0301)).unwrap();
+        assert!(matches!(
+            handle.next_completion().await.unwrap(),
+            ControlRequestProcessingResult::SuccessfulControlIn(data) if data == [0x01]
+        ));
     }
 }
