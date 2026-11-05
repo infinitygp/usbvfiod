@@ -171,6 +171,13 @@ impl<EH: HotplugEndpointHandle> EndpointWorker<EH> {
                             completion.send_anyhow(CompletionCode::Success)?;
                         }
                         EndpointMessage::Doorbell => {}
+                        // The endpoint is disabled while a transfer is pending, like when the
+                        // driver resets the device or the controller. The device forgets the
+                        // transfer, and the driver gets no event for it.
+                        EndpointMessage::Terminate(sender) => {
+                            self.real_endpoint.abandon().await?;
+                            self.state = WorkerState::Terminating(sender);
+                        }
                         msg => self.context_state_error(msg)?,
                     }
                 },
@@ -199,6 +206,9 @@ impl<EH: HotplugEndpointHandle> EndpointWorker<EH> {
                 WorkerState::Error => match self.next_msg().await? {
                     EndpointMessage::SetTrDequeuePointer(ptr, cs, completion) => {
                         self.state = WorkerState::SettingTrDequeuePointer(ptr, cs, completion);
+                    }
+                    EndpointMessage::Terminate(sender) => {
+                        self.state = WorkerState::Terminating(sender);
                     }
                     msg => self.context_state_error(msg)?,
                 },
@@ -278,20 +288,40 @@ pub struct EndpointSender {
 }
 
 impl EndpointSender {
+    /// The sender of an endpoint whose worker is gone.
+    #[cfg(test)]
+    pub fn closed() -> Self {
+        Self {
+            msg_sender: mpsc::unbounded_channel().0,
+        }
+    }
+
+    /// Tell the worker something. A worker that is gone because its endpoint failed does not fail
+    /// the slot that the endpoint belongs to: a command for the endpoint is answered with an
+    /// error.
+    fn send(&self, message: EndpointMessage) {
+        if let Err(err) = self.msg_sender.send(message) {
+            warn!("the worker of the endpoint is gone, dropping {:?}", err.0);
+            if let Some(completion) = err.0.try_get_completion_code_sender() {
+                let _ = completion.send(CompletionCode::EndpointNotEnabledError);
+            }
+        }
+    }
+
     pub fn doorbell(&self) -> anyhow::Result<()> {
-        self.msg_sender.send(EndpointMessage::Doorbell)?;
+        self.send(EndpointMessage::Doorbell);
 
         Ok(())
     }
 
     pub fn stop(&self, completion: oneshot::Sender<CompletionCode>) -> anyhow::Result<()> {
-        self.msg_sender.send(EndpointMessage::Stop(completion))?;
+        self.send(EndpointMessage::Stop(completion));
 
         Ok(())
     }
 
     pub fn reset(&self, completion: oneshot::Sender<CompletionCode>) -> anyhow::Result<()> {
-        self.msg_sender.send(EndpointMessage::Reset(completion))?;
+        self.send(EndpointMessage::Reset(completion));
 
         Ok(())
     }
@@ -302,11 +332,11 @@ impl EndpointSender {
         cycle_state: bool,
         completion: oneshot::Sender<CompletionCode>,
     ) -> anyhow::Result<()> {
-        self.msg_sender.send(EndpointMessage::SetTrDequeuePointer(
+        self.send(EndpointMessage::SetTrDequeuePointer(
             dequeue_pointer,
             cycle_state,
             completion,
-        ))?;
+        ));
 
         Ok(())
     }
@@ -336,6 +366,7 @@ pub mod tests {
 
     use super::*;
     use crate::device::{
+        bus::{BusDevice, Request, RequestSize},
         pcap::EndpointPcapMeta,
         xhci::{
             endpoint_handle::{ControlEndpointHandle, TdBasedInEndpointHandle},
@@ -460,106 +491,110 @@ pub mod tests {
                 )
             }
         }
+
+        /// What the real endpoints of the tests were asked to do.
+        #[derive(Debug, Default)]
+        pub struct Spy {
+            pub in_transfers: Mutex<Vec<usize>>,
+            pub control_requests: Mutex<Vec<UsbRequest>>,
+            pub cancels: AtomicUsize,
+        }
+
+        /// A real endpoint whose transfers never complete, like an interrupt endpoint without data.
+        #[derive(Debug)]
+        pub struct SlowIn(pub Arc<Spy>);
+
+        impl RealInEndpointHandle for SlowIn {
+            type TrbCompletionFuture<'a> =
+                Pin<Box<dyn Future<Output = anyhow::Result<InTrbProcessingResult>> + Send + 'a>>;
+
+            fn submit(&mut self, data: usize) -> anyhow::Result<()> {
+                self.0.in_transfers.lock().unwrap().push(data);
+                Ok(())
+            }
+
+            fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
+                Box::pin(pending())
+            }
+        }
+
+        impl BaseEndpointHandle for SlowIn {
+            type CompletionFuture<'a> =
+                Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+            fn cancel(&mut self) -> Self::CompletionFuture<'_> {
+                self.0.cancels.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// A real control endpoint that never answers.
+        #[derive(Debug)]
+        pub struct SlowControl(pub Arc<Spy>);
+
+        impl RealControlEndpointHandle for SlowControl {
+            type TrbCompletionFuture<'a> = Pin<
+                Box<
+                    dyn Future<Output = anyhow::Result<ControlRequestProcessingResult>> + Send + 'a,
+                >,
+            >;
+
+            fn submit_control_request(&mut self, request: UsbRequest) -> anyhow::Result<()> {
+                self.0.control_requests.lock().unwrap().push(request);
+                Ok(())
+            }
+
+            fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
+                Box::pin(pending())
+            }
+        }
+
+        impl BaseEndpointHandle for SlowControl {
+            type CompletionFuture<'a> =
+                Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+            fn cancel(&mut self) -> Self::CompletionFuture<'_> {
+                self.0.cancels.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// An interrupt IN endpoint whose transfers never complete.
+        pub fn slow_in(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
+            let spy = Arc::new(Spy::default());
+            let endpoint_id = 3;
+            let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
+                TdBasedInEndpointHandle::new(
+                    SLOT_ID,
+                    endpoint_id,
+                    EndpointPcapMeta::interrupt(1, SLOT_ID, endpoint_id),
+                    SlowIn(spy.clone()),
+                    bus,
+                    event_sender,
+                )
+            });
+            (harness, spy)
+        }
+
+        /// A control endpoint that never answers.
+        pub fn slow_control(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
+            let spy = Arc::new(Spy::default());
+            let endpoint_id = 1;
+            let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
+                ControlEndpointHandle::new(
+                    SLOT_ID,
+                    endpoint_id,
+                    EndpointPcapMeta::control(1, SLOT_ID, endpoint_id),
+                    SlowControl(spy.clone()),
+                    bus,
+                    event_sender,
+                )
+            });
+            (harness, spy)
+        }
     }
 
     use testutils::*;
-
-    /// What the real endpoints of the tests were asked to do.
-    #[derive(Debug, Default)]
-    struct Spy {
-        in_transfers: Mutex<Vec<usize>>,
-        control_requests: Mutex<Vec<UsbRequest>>,
-        cancels: AtomicUsize,
-    }
-
-    /// A real endpoint whose transfers never complete, like an interrupt endpoint without data.
-    #[derive(Debug)]
-    struct SlowIn(Arc<Spy>);
-
-    impl RealInEndpointHandle for SlowIn {
-        type TrbCompletionFuture<'a> =
-            Pin<Box<dyn Future<Output = anyhow::Result<InTrbProcessingResult>> + Send + 'a>>;
-
-        fn submit(&mut self, data: usize) -> anyhow::Result<()> {
-            self.0.in_transfers.lock().unwrap().push(data);
-            Ok(())
-        }
-
-        fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
-            Box::pin(pending())
-        }
-    }
-
-    impl BaseEndpointHandle for SlowIn {
-        type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
-
-        fn cancel(&mut self) -> Self::CompletionFuture<'_> {
-            self.0.cancels.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    /// A real control endpoint that never answers.
-    #[derive(Debug)]
-    struct SlowControl(Arc<Spy>);
-
-    impl RealControlEndpointHandle for SlowControl {
-        type TrbCompletionFuture<'a> = Pin<
-            Box<dyn Future<Output = anyhow::Result<ControlRequestProcessingResult>> + Send + 'a>,
-        >;
-
-        fn submit_control_request(&mut self, request: UsbRequest) -> anyhow::Result<()> {
-            self.0.control_requests.lock().unwrap().push(request);
-            Ok(())
-        }
-
-        fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
-            Box::pin(pending())
-        }
-    }
-
-    impl BaseEndpointHandle for SlowControl {
-        type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
-
-        fn cancel(&mut self) -> Self::CompletionFuture<'_> {
-            self.0.cancels.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(()) })
-        }
-    }
-
-    /// An interrupt IN endpoint whose transfers never complete.
-    fn slow_in(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
-        let spy = Arc::new(Spy::default());
-        let endpoint_id = 3;
-        let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
-            TdBasedInEndpointHandle::new(
-                SLOT_ID,
-                endpoint_id,
-                EndpointPcapMeta::interrupt(1, SLOT_ID, endpoint_id),
-                SlowIn(spy.clone()),
-                bus,
-                event_sender,
-            )
-        });
-        (harness, spy)
-    }
-
-    /// A control endpoint that never answers.
-    fn slow_control(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
-        let spy = Arc::new(Spy::default());
-        let endpoint_id = 1;
-        let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
-            ControlEndpointHandle::new(
-                SLOT_ID,
-                endpoint_id,
-                EndpointPcapMeta::control(1, SLOT_ID, endpoint_id),
-                SlowControl(spy.clone()),
-                bus,
-                event_sender,
-            )
-        });
-        (harness, spy)
-    }
 
     async fn eventually(mut condition: impl FnMut() -> bool) {
         for _ in 0..500 {
@@ -569,6 +604,71 @@ pub mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("the condition did not become true");
+    }
+
+    fn context_state(harness: &Harness) -> u64 {
+        harness.bus.read(Request::new(CONTEXT, RequestSize::Size1))
+    }
+
+    #[tokio::test]
+    async fn terminating_an_endpoint_with_a_pending_transfer_cancels_it_and_completes() {
+        let (harness, spy) = slow_in(&[trb(0, NORMAL)
+            .with_trb_transfer_length(8)
+            .with_data_pointer(BUFFER)
+            .build()]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| *spy.in_transfers.lock().unwrap() == [8]).await;
+
+        timeout(Duration::from_secs(5), harness.sender.terminate())
+            .await
+            .expect("the endpoint answers")
+            .expect("the endpoint terminates");
+
+        assert_eq!(spy.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(context_state(&harness), u64::from(endpoint_state::DISABLED));
+    }
+
+    #[tokio::test]
+    async fn terminating_an_endpoint_in_the_error_state_completes() {
+        // A Setup Stage TRB on an interrupt endpoint is a TRB Error.
+        let (harness, _spy) = slow_in(&[trb(0, SETUP_STAGE).build()]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| context_state(&harness) == u64::from(endpoint_state::ERROR)).await;
+
+        timeout(Duration::from_secs(5), harness.sender.terminate())
+            .await
+            .expect("the endpoint answers")
+            .expect("the endpoint terminates");
+
+        assert_eq!(context_state(&harness), u64::from(endpoint_state::DISABLED));
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_whose_worker_is_gone_answers_commands_with_an_error() {
+        let sender = EndpointSender::closed();
+
+        sender.doorbell().unwrap();
+        let (completion, result) = oneshot::channel();
+        sender.stop(completion).unwrap();
+        assert_eq!(
+            result.await.unwrap(),
+            CompletionCode::EndpointNotEnabledError
+        );
+        let (completion, result) = oneshot::channel();
+        sender.reset(completion).unwrap();
+        assert_eq!(
+            result.await.unwrap(),
+            CompletionCode::EndpointNotEnabledError
+        );
+        let (completion, result) = oneshot::channel();
+        sender
+            .set_tr_dequeue_pointer(0x1000, true, completion)
+            .unwrap();
+        assert_eq!(
+            result.await.unwrap(),
+            CompletionCode::EndpointNotEnabledError
+        );
+        sender.terminate().await.unwrap_err();
     }
 
     #[tokio::test]

@@ -60,6 +60,10 @@ pub trait HotplugEndpointHandle: BaseEndpointHandle {
     /// The endpoint handle works on a whole TD at a time, so an endpoint that stops does not
     /// continue with the TRB it stopped at, but with the first TRB of its TD.
     fn take_restart_position(&mut self) -> Option<(u64, bool)>;
+
+    /// Cancel what the endpoint handle works on because the endpoint is disabled. Unlike
+    /// [`BaseEndpointHandle::cancel`], this reports nothing to the driver.
+    fn abandon(&mut self) -> Self::CompletionFuture<'_>;
 }
 
 #[derive(Debug)]
@@ -266,6 +270,16 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
     fn take_restart_position(&mut self) -> Option<(u64, bool)> {
         self.restart_position.take()
     }
+
+    fn abandon(&mut self) -> Self::CompletionFuture<'_> {
+        Box::pin(async {
+            self.transfer_start = None;
+            self.restart_position = None;
+            self.cancel_device().await?;
+            self.submission_state = HotplugSubmissionState::NoTrbSubmitted;
+            Ok(())
+        })
+    }
 }
 
 impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
@@ -288,21 +302,28 @@ impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
             // Bit 0 of the fourth dword of a TRB is its cycle bit.
             self.restart_position = first_trb.map(|trb| (trb.address, trb.buffer[12] & 1 != 0));
 
-            if let Ok(mut guard) = self.endpoint_handle.try_lock() {
-                if let Some(device) = guard.as_mut() {
-                    device.cancel().await?;
-                } else {
-                    trace!("cancel for detached device");
-                }
-            } else {
-                trace!("try_lock failed during cancel: detach_handler currently has the lock");
-                // After the lock release, the device will be gone, so no need to actually acquire the lock.
-            }
-
+            self.cancel_device().await?;
             self.submission_state = HotplugSubmissionState::NoTrbSubmitted;
 
             Ok(())
         })
+    }
+}
+
+impl<EH: EndpointHandle> HotplugEndpointHandleImpl<EH> {
+    /// Cancel the transfer of the endpoint handle, if the device is still there.
+    async fn cancel_device(&self) -> anyhow::Result<()> {
+        if let Ok(mut guard) = self.endpoint_handle.try_lock() {
+            if let Some(device) = guard.as_mut() {
+                device.cancel().await?;
+            } else {
+                trace!("cancel for detached device");
+            }
+        } else {
+            trace!("try_lock failed during cancel: detach_handler currently has the lock");
+            // After the lock release, the device will be gone, so no need to actually acquire the lock.
+        }
+        Ok(())
     }
 }
 

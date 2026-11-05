@@ -1550,6 +1550,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabling_the_endpoint_unlinks_the_transfer_and_reports_nothing() {
+        let (device, mut peer, detach) = device();
+        let worker = interrupt_worker(&device);
+        worker.sender.doorbell().unwrap();
+        let (submit, _) = peer.submit().await;
+
+        // The Terminate message of Reset Device, Disable Slot or a controller reset waits for the
+        // answer to the unlink.
+        let (result, unlink) = tokio::join!(worker.sender.terminate(), async {
+            let unlink = peer.unlink().await;
+            peer.answer_unlink(unlink.seqnum, STATUS_CANCELLED).await;
+            unlink
+        });
+        result.unwrap();
+        assert_eq!(unlink.unlink_seqnum, submit.seqnum);
+        assert!(worker.interrupter.is_empty(), "the driver gets no event");
+        assert!(!detach.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn the_device_in_the_tree_follows_the_socket() {
         let (event_sender, _interrupter) = MockInterrupter::new();
         let port_array: PortArray<ControllerDevice> =

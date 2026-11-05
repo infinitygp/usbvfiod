@@ -186,7 +186,7 @@ impl SlotWorker {
                     sender.send_anyhow(result)?;
                 }
                 SlotMessage::DisableSlot(slot_id, sender) => {
-                    let result = self.disable_slot(slot_id).await?;
+                    let result = self.disable_slot(slot_id).await;
                     sender.send_anyhow(result)?;
                 }
                 SlotMessage::AddressDevice(trb_data, sender) => {
@@ -246,11 +246,11 @@ impl SlotWorker {
                         }
                     };
 
-                    let result = slot.handle_reset_device().await?;
+                    let result = slot.handle_reset_device().await;
                     sender.send_anyhow(result)?;
                 }
                 SlotMessage::ResetAllSlots(completion) => {
-                    self.reset().await?;
+                    self.reset().await;
                     completion.send_anyhow(())?;
                 }
                 SlotMessage::StopEndpoint(slot_id, endpoint_id, sender) => {
@@ -354,34 +354,30 @@ impl SlotWorker {
         available_slot_id.ok_or(CompletionCode::NoSlotsAvailableError)
     }
 
-    async fn disable_slot(&mut self, slot_id: u8) -> anyhow::Result<CompletionCode> {
+    async fn disable_slot(&mut self, slot_id: u8) -> CompletionCode {
         let slot = match self
             .slots
             .get_mut(slot_id as usize)
             .and_then(|opt| opt.as_mut())
         {
             Some(slot) => slot,
-            None => return Ok(CompletionCode::SlotNotEnabledError),
+            None => return CompletionCode::SlotNotEnabledError,
         };
         // let slot clean up itself
-        slot.pre_drop().await?;
+        slot.pre_drop().await;
         // Safety: above match statements proved the slot_id is valid
         self.slots[slot_id as usize] = None;
 
-        Ok(CompletionCode::Success)
+        CompletionCode::Success
     }
 
-    async fn reset(&mut self) -> anyhow::Result<()> {
-        let mut result = Ok(());
-
+    async fn reset(&mut self) {
         self.config_reg.reset();
         self.dcbaap.reset();
 
         for mut slot in self.slots.iter_mut().filter_map(Option::take) {
-            result = result.and(slot.pre_drop().await);
+            slot.pre_drop().await;
         }
-
-        result
     }
 }
 
@@ -500,7 +496,7 @@ impl Slot {
                 let base_address = *base_address;
 
                 // ep0 worker is already running. Terminate before copying ep0 context.
-                self.deconfigure_endpoint(1).await?;
+                self.deconfigure_endpoint(1).await;
 
                 self.state = SlotState::Addressed(base_address);
                 base_address
@@ -672,7 +668,7 @@ impl Slot {
 
         if deconfigure {
             for ep_id in 2..=31 {
-                self.deconfigure_endpoint(ep_id).await?;
+                self.deconfigure_endpoint(ep_id).await;
             }
 
             self.state = SlotState::Addressed(base_address);
@@ -700,7 +696,7 @@ impl Slot {
             }
 
             for ep in to_deconfigure {
-                self.deconfigure_endpoint(ep).await?;
+                self.deconfigure_endpoint(ep).await;
             }
 
             for ep in to_configure {
@@ -716,10 +712,14 @@ impl Slot {
         Ok(CompletionCode::Success)
     }
 
-    async fn deconfigure_endpoint(&mut self, endpoint_id: u8) -> anyhow::Result<()> {
+    /// Disable an endpoint. An endpoint whose worker failed already is disabled all the same, and
+    /// does not fail the command that disables it.
+    async fn deconfigure_endpoint(&mut self, endpoint_id: u8) {
         match self.endpoint_sender(endpoint_id) {
             Some(ep_sender) => {
-                ep_sender.terminate().await?;
+                if let Err(err) = ep_sender.terminate().await {
+                    warn!("could not terminate the worker of endpoint {endpoint_id}: {err}");
+                }
                 self.endpoint_senders[endpoint_id as usize] = None;
             }
             None => {
@@ -728,8 +728,6 @@ impl Slot {
                 );
             }
         }
-
-        Ok(())
     }
 
     // helper method for address_advice and configure_endpoint.
@@ -792,25 +790,23 @@ impl Slot {
     }
 
     // call before dropping (disabling this slot)
-    async fn pre_drop(&mut self) -> anyhow::Result<()> {
-        let mut result = Ok(());
-
+    async fn pre_drop(&mut self) {
         // disable all active endpoints
         for endpoint_sender in self.endpoint_senders.iter_mut().filter_map(Option::take) {
-            result = result.and(endpoint_sender.terminate().await);
+            if let Err(err) = endpoint_sender.terminate().await {
+                warn!("could not terminate the worker of an endpoint: {err}");
+            }
         }
-
-        result
     }
 
-    async fn handle_reset_device(&mut self) -> anyhow::Result<CompletionCode> {
+    async fn handle_reset_device(&mut self) -> CompletionCode {
         let base_address = match self.state {
             SlotState::Enabled | SlotState::Default(_) => {
                 warn!(
                     "ResetDevice in state {:?} is treated as ContextStateError",
                     self.state
                 );
-                return Ok(CompletionCode::ContextStateError);
+                return CompletionCode::ContextStateError;
             }
             SlotState::Addressed(base_address) => base_address,
             SlotState::Configured(base_address) => base_address,
@@ -818,13 +814,13 @@ impl Slot {
 
         // disable all endpoints except control
         for ep_id in 2..=31 {
-            self.deconfigure_endpoint(ep_id).await?;
+            self.deconfigure_endpoint(ep_id).await;
         }
 
         self.state = SlotState::Default(base_address);
         self.write_slot_state();
 
-        Ok(CompletionCode::Success)
+        CompletionCode::Success
     }
 }
 
@@ -1132,6 +1128,140 @@ mod context_tests {
         );
 
         assert_eq!(output_dwords(&ram), [0x0400_0041, 0x0405_ffff, 0xffc0_0102]);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use std::{
+        sync::{atomic::Ordering, Arc},
+        time::Duration,
+    };
+
+    use super::*;
+    use crate::device::{
+        bus::BusDevice,
+        pci::constants::xhci::device_slots::endpoint_state,
+        xhci::endpoint::tests::testutils::{slow_in, trb, Harness, Spy, BUFFER, CONTEXT, NORMAL},
+    };
+
+    const DEVICE_CONTEXT: u64 = 0x3000;
+
+    /// A slot in the Addressed state whose endpoint 3 waits for a transfer of the device.
+    async fn slot_with_a_pending_transfer() -> (Slot, Harness, Arc<Spy>) {
+        let (harness, spy) = slow_in(&[trb(0, NORMAL)
+            .with_trb_transfer_length(8)
+            .with_data_pointer(BUFFER)
+            .build()]);
+        harness.sender.doorbell().unwrap();
+        for _ in 0..500 {
+            if !spy.in_transfers.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(*spy.in_transfers.lock().unwrap(), [8]);
+
+        let mut slot = Slot::new(1, 0x3800, harness.bus.clone(), LaunchRequester::closed());
+        slot.state = SlotState::Addressed(DEVICE_CONTEXT);
+        slot.endpoint_senders[3] = Some(harness.sender.clone());
+        (slot, harness, spy)
+    }
+
+    fn endpoint_context_state(harness: &Harness) -> u64 {
+        harness.bus.read(Request::new(CONTEXT, RequestSize::Size1))
+    }
+
+    #[tokio::test]
+    async fn resetting_a_device_with_a_pending_transfer_terminates_the_endpoint() {
+        let (mut slot, harness, spy) = slot_with_a_pending_transfer().await;
+
+        let result = slot.handle_reset_device().await;
+
+        assert_eq!(result, CompletionCode::Success);
+        assert!(slot.endpoint_sender(3).is_none());
+        assert_eq!(spy.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            endpoint_context_state(&harness),
+            u64::from(endpoint_state::DISABLED)
+        );
+    }
+
+    #[tokio::test]
+    async fn disabling_a_slot_with_a_pending_transfer_terminates_the_endpoint() {
+        let (slot, harness, spy) = slot_with_a_pending_transfer().await;
+        let (_messages, msg_recv) = mpsc::unbounded_channel();
+        let mut worker = SlotWorker::new(
+            harness.bus.clone(),
+            ConfigureRegister::default(),
+            DcbaapRegister::default(),
+            LaunchRequester::closed(),
+            msg_recv,
+        );
+        worker.slots[1] = Some(slot);
+
+        let result = worker.disable_slot(1).await;
+
+        assert_eq!(result, CompletionCode::Success);
+        assert!(worker.slot_ref(1).is_none());
+        assert_eq!(spy.cancels.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            endpoint_context_state(&harness),
+            u64::from(endpoint_state::DISABLED)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_controller_reset_terminates_the_endpoints_with_pending_transfers() {
+        let (slot, harness, spy) = slot_with_a_pending_transfer().await;
+        let (_messages, msg_recv) = mpsc::unbounded_channel();
+        let mut worker = SlotWorker::new(
+            harness.bus.clone(),
+            ConfigureRegister::default(),
+            DcbaapRegister::default(),
+            LaunchRequester::closed(),
+            msg_recv,
+        );
+        worker.slots[1] = Some(slot);
+
+        worker.reset().await;
+
+        assert!(worker.slot_ref(1).is_none());
+        assert_eq!(spy.cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_is_gone_does_not_fail_the_commands_for_the_slot() {
+        let bus: BusDeviceRef = Arc::new(crate::device::bus::testutils::TestBusDevice::new(
+            &[0u8; 0x4000],
+        ));
+        let (_messages, msg_recv) = mpsc::unbounded_channel();
+        let mut worker = SlotWorker::new(
+            bus.clone(),
+            ConfigureRegister::default(),
+            DcbaapRegister::default(),
+            LaunchRequester::closed(),
+            msg_recv,
+        );
+        let slot_with_dead_endpoints = || {
+            let mut slot = Slot::new(1, 0x3800, bus.clone(), LaunchRequester::closed());
+            slot.state = SlotState::Configured(DEVICE_CONTEXT);
+            slot.endpoint_senders[4] = Some(EndpointSender::closed());
+            slot.endpoint_senders[5] = Some(EndpointSender::closed());
+            slot
+        };
+
+        let mut slot = slot_with_dead_endpoints();
+        assert_eq!(slot.handle_reset_device().await, CompletionCode::Success);
+        assert!(slot.endpoint_sender(4).is_none() && slot.endpoint_sender(5).is_none());
+
+        worker.slots[1] = Some(slot_with_dead_endpoints());
+        assert_eq!(worker.disable_slot(1).await, CompletionCode::Success);
+        assert!(worker.slot_ref(1).is_none());
+
+        worker.slots[1] = Some(slot_with_dead_endpoints());
+        worker.reset().await;
+        assert!(worker.slot_ref(1).is_none());
     }
 }
 

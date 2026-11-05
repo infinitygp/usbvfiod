@@ -60,6 +60,14 @@ struct LaunchArgs {
 }
 
 impl LaunchRequester {
+    /// A requester that nobody serves.
+    #[cfg(test)]
+    pub fn closed() -> Self {
+        Self {
+            msg_send: mpsc::unbounded_channel().0,
+        }
+    }
+
     pub async fn request_launch(
         &self,
         slot_id: u8,
