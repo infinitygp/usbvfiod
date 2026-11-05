@@ -293,6 +293,10 @@ impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
             // waits for this event. The transfer did not start on the device while its TRBs were
             // collected, so it starts again from its first TRB, which the event names.
             let first_trb = self.transfer_start.take();
+
+            // The device is done with the transfer when the event goes out.
+            self.cancel_device().await?;
+
             if let (HotplugSubmissionState::TrbSubmitted { .. }, Some(first_trb)) =
                 (&self.submission_state, &first_trb)
             {
@@ -301,8 +305,6 @@ impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
             }
             // Bit 0 of the fourth dword of a TRB is its cycle bit.
             self.restart_position = first_trb.map(|trb| (trb.address, trb.buffer[12] & 1 != 0));
-
-            self.cancel_device().await?;
             self.submission_state = HotplugSubmissionState::NoTrbSubmitted;
 
             Ok(())

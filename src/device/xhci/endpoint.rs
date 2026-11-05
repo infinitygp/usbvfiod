@@ -124,7 +124,10 @@ impl<EH: HotplugEndpointHandle> EndpointWorker<EH> {
                         self.state = WorkerState::WaitForDoorbell;
                     }
                 }
+                // A completion that is there wins over a stop that is there as well: the transfer
+                // is done, and the stop finds the endpoint idle.
                 WorkerState::WaitForTrbCompletion => select! {
+                    biased;
                     result = self.real_endpoint.next_completion() => match result? {
                         HotplugTrbProcessingResult::Ok => {
                             self.transfer_ring.advance();
@@ -356,7 +359,7 @@ pub mod tests {
         future::{pending, Future},
         pin::Pin,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
@@ -369,13 +372,16 @@ pub mod tests {
         bus::{BusDevice, Request, RequestSize},
         pcap::EndpointPcapMeta,
         xhci::{
-            endpoint_handle::{ControlEndpointHandle, TdBasedInEndpointHandle},
+            endpoint_handle::{
+                tests::testutils::MockRealInEndpoint, ControlEndpointHandle,
+                TdBasedInEndpointHandle,
+            },
             hotplug_endpoint_handle::BaseEndpointHandle,
             real_endpoint_handle::{
                 ControlRequestProcessingResult, InTrbProcessingResult, RealControlEndpointHandle,
                 RealInEndpointHandle,
             },
-            trb::{testutils::RawTrbBuilder, RawTrb},
+            trb::{testutils::RawTrbBuilder, EventTrb, RawTrb},
             usbrequest::UsbRequest,
         },
     };
@@ -498,6 +504,8 @@ pub mod tests {
             pub in_transfers: Mutex<Vec<usize>>,
             pub control_requests: Mutex<Vec<UsbRequest>>,
             pub cancels: AtomicUsize,
+            /// While this is set, a cancel does not finish.
+            pub block_cancel: AtomicBool,
         }
 
         /// A real endpoint whose transfers never complete, like an interrupt endpoint without data.
@@ -524,7 +532,13 @@ pub mod tests {
 
             fn cancel(&mut self) -> Self::CompletionFuture<'_> {
                 self.0.cancels.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Ok(()) })
+                let spy = self.0.clone();
+                Box::pin(async move {
+                    while spy.block_cancel.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    Ok(())
+                })
             }
         }
 
@@ -669,6 +683,82 @@ pub mod tests {
             CompletionCode::EndpointNotEnabledError
         );
         sender.terminate().await.unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn a_transfer_that_completed_is_not_stopped() {
+        // The completion of the device and the Stop Endpoint command are both there when the worker
+        // waits for the completion. The transfer is done then, and the stop finds the endpoint idle.
+        for round in 0..40 {
+            let endpoint_id = 3;
+            let mut harness = Harness::launch(
+                endpoint_id,
+                &[trb(0, NORMAL)
+                    .with_trb_transfer_length(8)
+                    .with_data_pointer(BUFFER)
+                    .with_interrupt_on_completion()
+                    .build()],
+                |bus, event_sender| {
+                    TdBasedInEndpointHandle::new(
+                        SLOT_ID,
+                        endpoint_id,
+                        EndpointPcapMeta::interrupt(1, SLOT_ID, endpoint_id),
+                        MockRealInEndpoint::new(None),
+                        bus,
+                        event_sender,
+                    )
+                },
+            );
+            harness.sender.doorbell().unwrap();
+
+            assert_eq!(harness.stop().await, CompletionCode::Success);
+
+            assert_eq!(
+                harness.interrupter.await_event().await,
+                Some(EventTrb::new_transfer_event_trb(
+                    RING,
+                    0,
+                    CompletionCode::Success,
+                    false,
+                    endpoint_id,
+                    SLOT_ID
+                )),
+                "round {round}"
+            );
+            assert!(harness.interrupter.is_empty(), "round {round}");
+            assert_eq!(harness.dequeue_pointer().0, RING + 16, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_stopped_event_comes_after_the_cancel_and_before_the_command_completion() {
+        let (mut harness, spy) = slow_in(&[trb(0, NORMAL)
+            .with_trb_transfer_length(8)
+            .with_data_pointer(BUFFER)
+            .build()]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| *spy.in_transfers.lock().unwrap() == [8]).await;
+        spy.block_cancel.store(true, Ordering::SeqCst);
+
+        let (completion, result) = oneshot::channel();
+        harness.sender.stop(completion).unwrap();
+        eventually(|| spy.cancels.load(Ordering::SeqCst) == 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // The device did not say yet whether the transfer got through.
+        assert!(harness.interrupter.is_empty());
+        spy.block_cancel.store(false, Ordering::SeqCst);
+        assert_eq!(
+            timeout(Duration::from_secs(5), result)
+                .await
+                .unwrap()
+                .unwrap(),
+            CompletionCode::Success
+        );
+        assert_eq!(
+            harness.interrupter.await_event().await,
+            Some(harness.stopped(RING, 8))
+        );
     }
 
     #[tokio::test]

@@ -477,7 +477,10 @@ impl<EpType: BulkOrInterrupt, Dir: EndpointDirection> BaseEndpointHandle
             let ep = self.endpoint();
             ep.cancel_all();
 
-            // have to consume all cancelled TRBs (should be 0 or 1)
+            // have to consume all cancelled TRBs (should be 0 or 1). A transfer that finished
+            // before the cancel took effect loses its result here. The endpoint worker prefers a
+            // completion that is there over a stop, which leaves only the moment between its
+            // decision and the cancel.
             if ep.pending() > 1 {
                 warn!("while cancelling: saw more than one pending TRB");
             }
