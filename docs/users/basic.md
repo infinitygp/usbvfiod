@@ -76,6 +76,10 @@ Requesting detach of device 009:003
 SuccessfulOperation
 ```
 
+Devices can also be attached below virtual USB hubs, at a port path such as `5.1.4`. Use
+`--hub`, `--attach-at`, `--virtual-hid`, `--detach-at` and `--tree` for that, as described in
+[Hubs and Port Paths](./hubs.md).
+
 ## Device Access Restrictions
 
 The `usbvfiod` server and `remote` binary do not require elevated privileges.

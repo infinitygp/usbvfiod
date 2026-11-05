@@ -46,7 +46,10 @@ $ virsh qemu-monitor-command DOMAIN '{"execute":"device_add","arguments":{"drive
 ```
 
 Windows 11 and Linux guests load their built-in xHCI driver for the controller. Devices are
-attached and detached with the `remote` binary as described in [Basic Setup](./basic.md).
+attached and detached with the `remote` binary as described in [Basic Setup](./basic.md). Virtual
+hubs below the root ports, and devices at port paths behind them, are described in
+[Hubs and Port Paths](./hubs.md): a Windows guest shows a device of the path `5.1.1.4` with the
+location path `...#USBROOT(0)#USB(5)#USB(1)#USB(1)#USB(4)`.
 
 ## Known limitations
 

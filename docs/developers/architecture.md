@@ -87,7 +87,12 @@ controller](https://en.wikipedia.org/wiki/Extensible_Host_Controller_Interface)
 on its virtual PCI bus. Passed-through USB devices will appear as USB
 devices of this virtual XHCI controller.
 
-For simplicity, we initially aim for a flat USB hierarchy without hubs
-(besides the root hub). This limits the design to less than 127
-devices. Our typical setup will only involve a handful of devices and
-setups with more devices may initially not be optimized.
+Passed-through devices sit on the root ports (the flat USB hierarchy that
+the design started with). In addition, the controller can hold virtual
+USB 2.0 hubs, with devices on their ports, up to five hubs deep: the
+controller keeps a tree of devices, finds the device of a slot by the root
+hub port number and the route string of its slot context, and sends the
+transfers directly to that device. See [Hubs and Port
+Paths](../users/hubs.md). The controller has 32 device slots. Our typical
+setup will only involve a handful of devices and setups with more devices
+may initially not be optimized.
