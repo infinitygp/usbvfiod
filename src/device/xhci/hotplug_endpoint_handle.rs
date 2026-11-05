@@ -67,8 +67,11 @@ pub struct HotplugEndpointHandleImpl<EH: EndpointHandle> {
 enum HotplugSubmissionState {
     #[default]
     NoTrbSubmitted,
-    // TRB address
-    TrbSubmitted(u64),
+    TrbSubmitted {
+        address: u64,
+        /// The bytes the TRB transfers, which are left when the transfer is stopped.
+        transfer_length: u32,
+    },
 }
 
 impl<EH: EndpointHandle> HotplugEndpointHandleImpl<EH> {
@@ -140,7 +143,16 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
         // independently of whether we forward the TRB to the endpoint handle, we need
         // to track that we submitted the TRB. We have to send transaction error event
         // with TRB address even if device is gone.
-        self.submission_state = HotplugSubmissionState::TrbSubmitted(trb.address);
+        self.submission_state = HotplugSubmissionState::TrbSubmitted {
+            address: trb.address,
+            // Bits 0 to 16 of the third dword of a transfer TRB.
+            transfer_length: u32::from_le_bytes([
+                trb.buffer[8],
+                trb.buffer[9],
+                trb.buffer[10],
+                trb.buffer[11],
+            ]) & 0x1_ffff,
+        };
 
         if let Ok(mut guard) = self.endpoint_handle.try_lock() {
             if let Some(device) = guard.as_mut() {
@@ -159,7 +171,7 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
     fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
         Box::pin(async {
             let trb_addr = match self.submission_state {
-                HotplugSubmissionState::TrbSubmitted(addr) => addr,
+                HotplugSubmissionState::TrbSubmitted { address, .. } => address,
                 HotplugSubmissionState::NoTrbSubmitted => {
                     panic!("next_completion called without prior submit_trb")
                 }
@@ -207,6 +219,25 @@ impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
 
     fn cancel(&mut self) -> Self::CompletionFuture<'_> {
         Box::pin(async {
+            // The endpoint stops while the xHC works on a TRB. The xHC reports the TRB it stopped
+            // on before the completion of the Stop Endpoint command (xHCI 4.6.9). A driver that
+            // stops an endpoint with a pending transfer, like the one of a hub that is suspended,
+            // waits for this event.
+            if let HotplugSubmissionState::TrbSubmitted {
+                address,
+                transfer_length,
+            } = self.submission_state
+            {
+                self.event_sender.send(EventTrb::new_transfer_event_trb(
+                    address,
+                    transfer_length,
+                    CompletionCode::Stopped,
+                    false,
+                    self.endpoint_id,
+                    self.slot_id,
+                ))?;
+            }
+
             if let Ok(mut guard) = self.endpoint_handle.try_lock() {
                 if let Some(device) = guard.as_mut() {
                     device.cancel().await?;
@@ -241,5 +272,48 @@ impl HotplugEndpointHandleImpl<DummyEndpointHandle> {
             // just a dummy; the drop implementation will notify, but nobody listens
             notify_drop: CancellationToken::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device::xhci::{
+        interrupter::tests::testutils::MockInterrupter, trb::testutils::RawTrbBuilder,
+    };
+
+    #[tokio::test]
+    async fn stopping_an_endpoint_with_a_pending_transfer_reports_the_stopped_trb() {
+        let (event_sender, mut interrupter) = MockInterrupter::new();
+        let mut handle = HotplugEndpointHandleImpl::dummy(3, 5, event_sender);
+        let trb = RawTrbBuilder::new(0x1000)
+            .with_trb_type(1)
+            .with_trb_transfer_length(2)
+            .build();
+
+        handle.submit_trb(trb).unwrap();
+        handle.cancel().await.unwrap();
+
+        assert_eq!(
+            interrupter.await_event().await,
+            Some(EventTrb::new_transfer_event_trb(
+                0x1000,
+                2,
+                CompletionCode::Stopped,
+                false,
+                5,
+                3
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn stopping_an_idle_endpoint_reports_nothing() {
+        let (event_sender, interrupter) = MockInterrupter::new();
+        let mut handle = HotplugEndpointHandleImpl::dummy(3, 5, event_sender);
+
+        handle.cancel().await.unwrap();
+
+        assert!(interrupter.is_empty());
     }
 }
