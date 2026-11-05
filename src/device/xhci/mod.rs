@@ -6,6 +6,7 @@ pub mod endpoint;
 pub mod endpoint_handle;
 pub mod endpoint_launcher;
 pub mod event_ring;
+pub mod external_device;
 pub mod hotplug_endpoint_handle;
 pub mod hub_ports;
 pub mod interrupter;

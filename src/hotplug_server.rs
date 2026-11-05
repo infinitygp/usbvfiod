@@ -2,7 +2,10 @@
 
 use std::{
     fs::File,
-    os::unix::net::{UnixListener, UnixStream},
+    os::{
+        fd::OwnedFd,
+        unix::net::{UnixListener, UnixStream},
+    },
     sync::atomic::{AtomicU32, Ordering},
     time::Duration,
 };
@@ -10,6 +13,7 @@ use std::{
 use anyhow::{Context, Result};
 use nusb::MaybeFuture;
 use tokio::runtime;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 use usbvfiod::hotplug_protocol::{
     command::Command,
@@ -21,6 +25,7 @@ use usbvfiod::hotplug_protocol::{
 
 use crate::device::xhci::{
     any_device::{AnyDevice, ControllerDevice},
+    external_device::{self, ExternalDevice},
     nusb::NusbRealDevice,
     port::HotplugControl,
     real_device::{CompleteRealDeviceImpl, DeviceId, Speed},
@@ -84,7 +89,7 @@ fn handle_command(
                 .into_iter()
                 .filter_map(|id| match id {
                     DeviceId::Host { bus, device } => Some((bus, device)),
-                    DeviceId::Virtual(_) => None,
+                    DeviceId::Virtual(_) | DeviceId::External(_) => None,
                 })
                 .collect();
             Response::ListFollowing
@@ -144,13 +149,31 @@ fn handle_command(
                 .send_over_socket(socket)
                 .context("Failed to send the reply to the detach-at command")?;
         }
-        Command::AttachExternal { .. } => {
-            Reply::with_message(
-                Response::InvalidRequest,
-                "external devices are not supported yet",
-            )
-            .send_over_socket(socket)
-            .context("Failed to send the reply to the attach-external command")?;
+        Command::AttachExternal {
+            path,
+            speed,
+            name,
+            fd,
+        } => {
+            let reply = match external_speed(speed) {
+                Ok(speed) => match external_device(fd, speed, name, async_runtime) {
+                    Ok((device, detach)) => {
+                        let response =
+                            async_runtime.block_on(hotplug_control.attach_at(path, device));
+                        if response != Response::SuccessfulOperation {
+                            // The device is dropped, and the process on the other end of the
+                            // socket learns that it was not attached.
+                            detach.cancel();
+                        }
+                        reply_to_attach(response, path)
+                    }
+                    Err(err) => Reply::with_message(Response::FailedToOpenFd, format!("{err:#}")),
+                },
+                Err(err) => Reply::with_message(Response::InvalidRequest, format!("{err:#}")),
+            };
+            reply
+                .send_over_socket(socket)
+                .context("Failed to send the reply to the attach-external command")?;
         }
         Command::Tree => {
             let tree = async_runtime
@@ -159,7 +182,7 @@ fn handle_command(
                 .map(|node| TreeEntry {
                     path: node.path,
                     speed: node.speed.into(),
-                    id: node.id.to_string(),
+                    id: describe(node.id),
                     hub_ports: node.hub_ports,
                 })
                 .collect();
@@ -179,6 +202,14 @@ fn next_virtual_id() -> DeviceId {
     DeviceId::Virtual(NEXT_VIRTUAL_ID.fetch_add(1, Ordering::Relaxed))
 }
 
+/// How the tree listing names a device.
+fn describe(id: DeviceId) -> String {
+    match id {
+        DeviceId::External(number) => external_device::describe(number),
+        other => other.to_string(),
+    }
+}
+
 /// Open a device of the host from the file descriptor that the client sent.
 fn attach_host_device(
     fd: File,
@@ -194,6 +225,46 @@ fn attach_host_device(
         DeviceId::Host { bus, device: dev },
         AnyDevice::new(real_device),
     ))
+}
+
+fn external_speed(speed: UsbSpeed) -> Result<Speed> {
+    match speed {
+        UsbSpeed::Low => Ok(Speed::Low),
+        UsbSpeed::Full => Ok(Speed::Full),
+        UsbSpeed::High => Ok(Speed::High),
+        other => anyhow::bail!(
+            "an external device is a low, full or high speed device, not a {other} one"
+        ),
+    }
+}
+
+/// Serve an external device on the socket that the client sent. The token of the device is
+/// returned too, so that the caller can end the device if it is not attached.
+fn external_device(
+    fd: File,
+    speed: Speed,
+    name: Option<String>,
+    async_runtime: &runtime::Handle,
+) -> Result<(ControllerDevice, CancellationToken)> {
+    let stream = UnixStream::from(OwnedFd::from(fd));
+    stream
+        .peer_addr()
+        .context("the file descriptor is not a connected unix stream socket")?;
+    stream
+        .set_nonblocking(true)
+        .context("Failed to make the socket non-blocking")?;
+    let _runtime_context = async_runtime.enter();
+    let stream = tokio::net::UnixStream::from_std(stream)
+        .context("Failed to register the socket with the runtime")?;
+
+    let number = NEXT_VIRTUAL_ID.fetch_add(1, Ordering::Relaxed);
+    let detach = CancellationToken::new();
+    let device = ExternalDevice::start(stream, speed, number, name, detach.clone(), async_runtime);
+    let mut device =
+        CompleteRealDeviceImpl::new(DeviceId::External(number), AnyDevice::new(device));
+    // The task of the device and the controller share the token.
+    device.cancel = detach.clone();
+    Ok((device, detach))
 }
 
 fn virtual_hub(spec: &HubSpec) -> Result<ControllerDevice> {
@@ -480,6 +551,142 @@ mod tests {
         });
 
         assert_eq!(reply.response, Response::SuccessfulOperation, "{reply:?}");
+    }
+
+    /// A socket for an external device: the end for the controller as a file, and the end for the
+    /// process that serves the device.
+    fn socket_pair() -> (File, UnixStream) {
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        theirs
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        (File::from(OwnedFd::from(ours)), theirs)
+    }
+
+    fn attach_external(
+        server: &TestServer,
+        at: &str,
+        speed: UsbSpeed,
+        name: &str,
+    ) -> (Reply, UnixStream) {
+        let (fd, theirs) = socket_pair();
+        let reply = server.ask(Command::AttachExternal {
+            path: path(at),
+            speed,
+            name: Some(name.to_string()),
+            fd,
+        });
+        (reply, theirs)
+    }
+
+    /// Whether the other end of the socket sees the end of the stream.
+    fn is_closed(socket: &mut UnixStream) -> bool {
+        use std::io::Read;
+        matches!(socket.read(&mut [0u8; 1]), Ok(0))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_external_device_is_attached_listed_and_detached_with_its_socket() {
+        let server = TestServer::start("external");
+        assert_eq!(
+            server
+                .ask(Command::AttachHub {
+                    path: path("5"),
+                    spec: hub_spec(4, UsbSpeed::High),
+                })
+                .response,
+            Response::SuccessfulOperation
+        );
+
+        let (reply, mut keys) = attach_external(&server, "5.2", UsbSpeed::Full, "Test keypad");
+        assert_eq!(reply.response, Response::SuccessfulOperation, "{reply:?}");
+        let (reply, dial) = attach_external(&server, "5.3", UsbSpeed::High, "Dial Display");
+        assert_eq!(reply.response, Response::SuccessfulOperation, "{reply:?}");
+
+        let tree = server.ask(Command::Tree).tree;
+        assert_eq!(
+            tree.iter()
+                .map(|entry| (entry.path.to_string(), entry.speed))
+                .collect::<Vec<_>>(),
+            [
+                ("5".to_string(), UsbSpeed::High),
+                ("5.2".to_string(), UsbSpeed::Full),
+                ("5.3".to_string(), UsbSpeed::High),
+            ]
+        );
+        assert!(tree[0].id.starts_with("virtual "));
+        assert_eq!(tree[1].id, "external Test keypad");
+        assert_eq!(tree[2].id, "external Dial Display");
+
+        // The legacy list only knows the devices of the host.
+        let mut legacy = server.connect();
+        Command::List.send_over_socket(&legacy).unwrap();
+        let response = Response::receive_from_socket(&mut legacy).unwrap();
+        assert_eq!(response.receive_devices_list(&mut legacy).unwrap(), []);
+
+        // A detach command shuts the socket down.
+        assert_eq!(
+            server.ask(Command::DetachAt { path: path("5.2") }).response,
+            Response::SuccessfulOperation
+        );
+        assert!(is_closed(&mut keys));
+        assert_eq!(tree_paths(&server), ["5", "5.3"]);
+
+        // A process that closes its end takes the device out of the tree.
+        drop(dial);
+        for _ in 0..500 {
+            if tree_paths(&server) == ["5"] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(tree_paths(&server), ["5"]);
+
+        // The path can be used again.
+        let (reply, _again) = attach_external(&server, "5.2", UsbSpeed::Low, "again");
+        assert_eq!(reply.response, Response::SuccessfulOperation, "{reply:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_external_device_loses_its_socket_and_the_reply_says_why() {
+        let server = TestServer::start("external-refused");
+        assert_eq!(
+            server
+                .ask(Command::AttachHub {
+                    path: path("5"),
+                    spec: hub_spec(2, UsbSpeed::Full),
+                })
+                .response,
+            Response::SuccessfulOperation
+        );
+        let (reply, _first) = attach_external(&server, "5.1", UsbSpeed::Full, "first");
+        assert_eq!(reply.response, Response::SuccessfulOperation, "{reply:?}");
+
+        for (at, speed, response) in [
+            ("5.1", UsbSpeed::Full, Response::PathOccupied),
+            ("5.3", UsbSpeed::Full, Response::NoSuchPath),
+            ("6.1", UsbSpeed::Full, Response::NoSuchPath),
+            ("5.1.1", UsbSpeed::Full, Response::NotAHub),
+            // A high speed device below a full speed hub, and speeds that the protocol lacks.
+            ("5.2", UsbSpeed::High, Response::SpeedNotSupported),
+            ("5.2", UsbSpeed::Super, Response::InvalidRequest),
+            ("5.2", UsbSpeed::SuperPlus, Response::InvalidRequest),
+        ] {
+            let (reply, mut theirs) = attach_external(&server, at, speed, "refused");
+            assert_eq!(reply.response, response, "{at} {speed}: {reply:?}");
+            assert!(reply.message.is_some(), "{at} {speed}: {reply:?}");
+            assert!(is_closed(&mut theirs), "{at} {speed}: the socket is closed");
+        }
+
+        // The descriptor must be a connected socket.
+        let reply = server.ask(Command::AttachExternal {
+            path: path("5.2"),
+            speed: UsbSpeed::Full,
+            name: None,
+            fd: File::open("/dev/null").unwrap(),
+        });
+        assert_eq!(reply.response, Response::FailedToOpenFd, "{reply:?}");
+        assert_eq!(tree_paths(&server), ["5", "5.1"]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

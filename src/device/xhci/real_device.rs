@@ -77,6 +77,9 @@ pub enum DeviceId {
     Host { bus: u8, device: u8 },
     /// An emulated device. The number is unique within the process.
     Virtual(u32),
+    /// A device that another process serves over a socket. The number is unique within the
+    /// process.
+    External(u32),
 }
 
 impl Identifier for DeviceId {}
@@ -86,6 +89,7 @@ impl fmt::Display for DeviceId {
         match self {
             Self::Host { bus, device } => write!(f, "host {bus:03}:{device:03}"),
             Self::Virtual(number) => write!(f, "virtual {number}"),
+            Self::External(number) => write!(f, "external #{number}"),
         }
     }
 }
