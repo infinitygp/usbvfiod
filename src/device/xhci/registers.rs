@@ -4,7 +4,7 @@ use std::sync::{
 };
 
 use tokio::sync::Notify;
-use tracing::{info, trace, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::device::{
     pci::constants::xhci::{
@@ -67,6 +67,15 @@ impl PortscRegister {
     /// PR bit is handled by a custom logic path.
     /// All other bits are treated as read-only.
     pub fn write(&self, new_value: u64) -> anyhow::Result<()> {
+        if new_value & portsc::LWS != 0 {
+            // The link of a device behind this controller is up as long as the device is attached.
+            debug!(
+                "port {}: ignoring the request for link state {}",
+                self.port_id,
+                (new_value & portsc::PLS) >> 5
+            );
+        }
+
         let bits_to_clear = new_value & BITMASK_RW1C;
         let port_reset_bit = new_value & portsc::PR != 0;
 

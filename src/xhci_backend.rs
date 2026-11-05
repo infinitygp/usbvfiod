@@ -967,6 +967,7 @@ mod tests {
     /// ```
     ///
     /// With `USBVFIOD_TEST_FLAP_SECS=N` the device is detached and attached again every N seconds.
+    /// `RUST_LOG=trace` logs every register access.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "runs until it is killed"]
     async fn serve_a_virtual_hid_to_a_guest() {
@@ -978,8 +979,10 @@ mod tests {
             .ok()
             .map(|secs| std::time::Duration::from_secs(secs.parse().unwrap()));
 
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("debug"));
         let subscriber = tracing_subscriber::FmtSubscriber::builder()
-            .with_max_level(tracing::Level::DEBUG)
+            .with_env_filter(filter)
             .with_ansi(false)
             .finish();
         tracing::subscriber::set_global_default(subscriber).unwrap();
