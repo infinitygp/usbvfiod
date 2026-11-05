@@ -238,12 +238,8 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
     }
 
     fn attach(&mut self, path: Option<PortPath>, device: CRD) -> anyhow::Result<Response> {
-        if let Some(existing) = self.path_of(device.identifier(), None) {
-            info!(
-                "A device with the same identifier is already attached and will be detached first"
-            );
-            self.detach_at(&existing)?;
-        }
+        // A device that is attached already is replaced, but only by a device that is accepted.
+        let existing = self.path_of(device.identifier(), None);
 
         let speed = match device.realdevice_ref().speed() {
             Some(speed) => speed,
@@ -255,7 +251,8 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             Some(path) => path,
             None => {
                 let available_port_id = match (1..=MAX_PORTS as usize).find(|&i| {
-                    self.devices.root_port_is_free(i as u8)
+                    (self.devices.root_port_is_free(i as u8)
+                        || existing == PortPath::root(i as u8).ok())
                         && self.portsc[i].usb_version() == version
                 }) {
                     Some(port) => port,
@@ -271,6 +268,16 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             }
             Some(_) => {}
             None => return Ok(Response::NoSuchPath),
+        }
+        if let Err(response) = self.devices.check_free(&path, speed, existing.as_ref()) {
+            return Ok(response);
+        }
+
+        if let Some(existing) = existing {
+            info!(
+                "A device with the same identifier is already attached and will be detached first"
+            );
+            self.detach_at(&existing)?;
         }
 
         let identifier = device.identifier();
@@ -919,6 +926,149 @@ mod tests {
                 .map(|node| node.path.to_string())
                 .collect();
             assert_eq!(paths, ["1", "6", "6.2"]);
+        }
+
+        /// The paths of the devices in the tree, with their identifiers.
+        async fn placed(control: &HotplugControl<TreeDevice>) -> Vec<(String, (u8, u8))> {
+            control
+                .tree()
+                .await
+                .into_iter()
+                .map(|node| (node.path.to_string(), node.id))
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn an_attach_that_is_refused_leaves_the_device_with_the_same_identifier_alone() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (full_hub, _) = hub(1, 4, Speed::Full);
+            assert_eq!(
+                control.attach_at(path("5"), full_hub).await,
+                Response::SuccessfulOperation
+            );
+            let first = device(2, Speed::Full);
+            let first_token = first.detach_token();
+            assert_eq!(
+                control.attach_at(path("5.1"), first).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(
+                control.attach_at(path("5.2"), device(3, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+            let before = placed(&control).await;
+
+            // The same device again, to places that do not take it.
+            for (at, device, expected) in [
+                ("5.2", device(2, Speed::Full), Response::PathOccupied),
+                ("5.9", device(2, Speed::Full), Response::NoSuchPath),
+                ("9", device(2, Speed::Full), Response::NoSuchPath),
+                ("5.3", device(2, Speed::High), Response::SpeedNotSupported),
+                ("1", device(2, Speed::Full), Response::SpeedNotSupported),
+                ("5.1.1", device(2, Speed::Full), Response::NotAHub),
+            ] {
+                assert_eq!(control.attach_at(path(at), device).await, expected, "{at}");
+                assert_eq!(placed(&control).await, before, "{at}");
+                assert!(!first_token.is_cancelled(), "{at}");
+            }
+        }
+
+        #[tokio::test]
+        async fn an_attach_of_a_device_that_is_attached_already_moves_it() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (full_hub, _) = hub(1, 4, Speed::Full);
+            assert_eq!(
+                control.attach_at(path("5"), full_hub).await,
+                Response::SuccessfulOperation
+            );
+            let first = device(2, Speed::Full);
+            let first_token = first.detach_token();
+            assert_eq!(
+                control.attach_at(path("5.1"), first).await,
+                Response::SuccessfulOperation
+            );
+
+            // To another port, and then to the port it is on, with a new instance each time.
+            let second = device(2, Speed::Full);
+            let second_token = second.detach_token();
+            assert_eq!(
+                control.attach_at(path("5.3"), second).await,
+                Response::SuccessfulOperation
+            );
+            assert!(first_token.is_cancelled());
+            assert_eq!(
+                placed(&control).await,
+                [("5".to_string(), (1, 1)), ("5.3".to_string(), (2, 2))]
+            );
+            assert_eq!(
+                control.attach_at(path("5.3"), device(2, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+            assert!(second_token.is_cancelled());
+            assert_eq!(placed(&control).await.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn a_hub_replaced_by_a_device_takes_the_ports_below_it_away() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_a, _) = hub(1, 4, Speed::High);
+            let (hub_b, _) = hub(2, 4, Speed::High);
+            for (at, device) in [("5", hub_a), ("5.1", hub_b)] {
+                assert_eq!(
+                    control.attach_at(path(at), device).await,
+                    Response::SuccessfulOperation
+                );
+            }
+            let before = placed(&control).await;
+
+            // A device with the identifier of the hub on the way cannot go below that hub, which
+            // is gone when the device is attached.
+            assert_eq!(
+                control
+                    .attach_at(path("5.1.2"), device(2, Speed::Full))
+                    .await,
+                Response::NoSuchPath
+            );
+            assert_eq!(placed(&control).await, before);
+            // It can take the place of the hub.
+            assert_eq!(
+                control.attach_at(path("5.1"), device(2, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+        }
+
+        #[tokio::test]
+        async fn a_device_without_a_path_that_is_attached_already_takes_a_free_root_port() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            assert_eq!(
+                control.attach(device(1, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(placed(&control).await, [("5".to_string(), (1, 1))]);
+
+            // Its own port is free when it is replaced.
+            assert_eq!(
+                control.attach(device(1, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(placed(&control).await, [("5".to_string(), (1, 1))]);
+
+            // A device that finds no port keeps the one it has.
+            for id in 2..=4 {
+                assert_eq!(
+                    control.attach(device(id, Speed::Full)).await,
+                    Response::SuccessfulOperation
+                );
+            }
+            assert_eq!(
+                control.attach(device(5, Speed::Full)).await,
+                Response::NoFreePort
+            );
+            assert_eq!(placed(&control).await.len(), 4);
         }
 
         #[tokio::test]

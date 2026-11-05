@@ -164,11 +164,20 @@ impl<CRD: CompleteRealDevice> DeviceTree<CRD> {
 
     /// The error with which a device of this speed cannot be attached at the path, or none if it
     /// can. The speed of the root port is not checked here.
-    fn check_free(&self, path: &PortPath, speed: Speed) -> Result<(), Response> {
+    ///
+    /// `replacing` is the path of a device that is detached before the new one is attached: its
+    /// path is free, and the hubs below it are gone.
+    pub fn check_free(
+        &self,
+        path: &PortPath,
+        speed: Speed,
+        replacing: Option<&PortPath>,
+    ) -> Result<(), Response> {
         let mut slot = self
             .roots
             .get(usize::from(path.root_port()))
             .ok_or(Response::NoSuchPath)?;
+        let mut hub_path = PortPath::root(path.root_port()).map_err(|_| Response::NoSuchPath)?;
         let mut parent_hub = None;
         for &port in path.hub_ports() {
             let hub = slot
@@ -177,13 +186,17 @@ impl<CRD: CompleteRealDevice> DeviceTree<CRD> {
                 .hub
                 .as_ref()
                 .ok_or(Response::NotAHub)?;
+            if replacing == Some(&hub_path) {
+                return Err(Response::NoSuchPath);
+            }
             slot = hub
                 .children
                 .get(usize::from(port) - 1)
                 .ok_or(Response::NoSuchPath)?;
             parent_hub = Some(&hub.handle);
+            hub_path = hub_path.child(port).map_err(|_| Response::NoSuchPath)?;
         }
-        if slot.is_some() {
+        if slot.is_some() && replacing != Some(path) {
             return Err(Response::PathOccupied);
         }
         if let Some(hub) = parent_hub {
@@ -203,7 +216,7 @@ impl<CRD: CompleteRealDevice> DeviceTree<CRD> {
         node: Node<CRD>,
         speed: Speed,
     ) -> Result<(), Response> {
-        self.check_free(&path, speed)?;
+        self.check_free(&path, speed, None)?;
         let hub_below = node.hub_handle().cloned();
         let slot = self.slot_mut(&path).ok_or(Response::NoSuchPath)?;
         *slot = Some(node);
