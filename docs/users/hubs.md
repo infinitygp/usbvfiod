@@ -96,8 +96,11 @@ change bit.
 
 A hub whose upstream port was suspended by the driver (Windows does this for idle hubs) resumes
 the port when a device is plugged in or removed, if the driver armed the remote wakeup of the
-hub. The hub above reports it as the end of the suspend of that port. Without this, a device
-that is attached to an idle hub would not show up in the guest.
+hub. The hub above reports it as the end of the suspend of that port, and a hub on a root port
+puts the root port in the resume state (`PORTSC.PLS` = 15, `PLC`, port status change event). A
+USB 2 root port with a hub on it follows the requests of the driver for the link state U3 and
+back to U0. Without this, a device that is attached to an idle tree would not show up in the
+guest.
 
 Transfers to the devices below a hub go directly to the device. The controller looks the device
 up by the root hub port number and the route string of the slot context, and does not emulate
@@ -138,6 +141,6 @@ times, no port indicators, all devices removable, 100 ms from power-on to power 
   low speed device of the host, which has not been tried.
 - The USB device address in the output slot context is not set, so tools that read it (USBView)
   show address 0.
-- A write of `PORTSC.PLS = U3` to a root port is ignored, so a hub on a root port is never
-  suspended through the root port, and a device on a suspended hub port does not stop sending
-  reports.
+- A write of `PORTSC.PLS = U3` is ignored for ports of USB 3 and for root ports without a hub,
+  and a device that is suspended below a hub does not stop sending reports. Only a hub can wake
+  a port.

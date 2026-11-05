@@ -6,7 +6,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use usbvfiod::hotplug_protocol::{port_path::PortPath, response::Response};
 
 use crate::{
@@ -69,12 +69,20 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
     }
 
     pub fn write_portsc(&self, port_id: usize, value: u64) -> anyhow::Result<()> {
+        let was_suspended = self.portsc[port_id].is_suspended();
         self.portsc[port_id].write(value)?;
 
         if value & portsc::PR != 0 {
             // The reset of the port reaches a hub on it, which starts from scratch.
             self.msg_sender
                 .send(PortMessage::RootPortReset(port_id as u8))
+                .map_err(|_| anyhow!("port channel closed"))?;
+        }
+        let is_suspended = self.portsc[port_id].is_suspended();
+        if is_suspended != was_suspended {
+            // A hub on the port learns that the bus is suspended, or active again.
+            self.msg_sender
+                .send(PortMessage::RootPortSuspended(port_id as u8, is_suspended))
                 .map_err(|_| anyhow!("port channel closed"))?;
         }
         Ok(())
@@ -168,6 +176,8 @@ pub enum PortMessage<CRD: CompleteRealDevice> {
     GetDevice(u8, u32, oneshot::Sender<Option<Arc<CRD>>>),
     // The upstream port of a hub on the root port is reset
     RootPortReset(u8),
+    // The root port of a hub is suspended (true) or resumed (false)
+    RootPortSuspended(u8, bool),
     // Host Controller Reset
     ResetPorts(oneshot::Sender<()>),
 }
@@ -208,6 +218,9 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
                 }
                 PortMessage::RootPortReset(port_id) => {
                     self.devices.reset_hub_on_root_port(port_id);
+                }
+                PortMessage::RootPortSuspended(port_id, suspended) => {
+                    self.devices.set_root_hub_suspended(port_id, suspended);
                 }
                 PortMessage::ResetPorts(completion) => {
                     self.reset_ports()?;
@@ -262,6 +275,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
 
         let identifier = device.identifier();
         let node = Node::new(device);
+        let hub_handle = node.hub_handle().cloned();
         let instance_id = node.instance_id.clone();
         let detach_token = node.device.detach_token();
         if let Err(response) = self.devices.attach(path, node, speed) {
@@ -276,6 +290,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
 
         if path.is_root() {
             self.portsc[root_port].set(connected_portsc(version, speed));
+            self.connect_hub_to_root_port(root_port, hub_handle);
 
             let event = EventTrb::new_port_status_change_event_trb(path.root_port());
             self.event_sender.send(event)?;
@@ -284,6 +299,21 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         info!("Attached {speed} device {identifier:?} at port path {path} ({version:?} root port)");
 
         Ok(Response::SuccessfulOperation)
+    }
+
+    /// A hub on a root port can be suspended by the driver, and wakes the root port when it has
+    /// a reason to.
+    fn connect_hub_to_root_port(&self, root_port: usize, hub: Option<HubHandle>) {
+        let Some(hub) = hub else {
+            return;
+        };
+        self.portsc[root_port].set_suspend_supported(true);
+        let portsc = self.portsc.clone();
+        hub.connect_to_root_port(move || {
+            if let Err(err) = portsc[root_port].remote_wakeup() {
+                warn!("could not wake root port {root_port}: {err}");
+            }
+        });
     }
 
     /// Bring the port registers into the state a Host Controller Reset leaves them in.
@@ -406,6 +436,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         if path.is_root() {
             let port_id = path.root_port();
             // update portsc register
+            self.portsc[usize::from(port_id)].set_suspend_supported(false);
             self.portsc[usize::from(port_id)].set(portsc::PP | portsc::CSC);
 
             // send port status change event
@@ -982,6 +1013,82 @@ mod tests {
 
             assert_eq!(hub_shared.configuration(), 0);
             assert_eq!(other_shared.configuration(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_hub_on_a_suspended_root_port_wakes_it_when_a_device_comes() {
+            let (port_array, mut interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            control.attach_at(path("5"), hub_device).await;
+            interrupter.await_event().await;
+            // The driver enables the port with a reset, powers the hub port, arms the wakeup of
+            // the hub and suspends the port.
+            port_array.write_portsc(5, portsc::PR).unwrap();
+            interrupter.await_event().await;
+            // The worker handles the reset of the hub before it answers this.
+            control.list_devices().await;
+            hub_shared.set_port_feature(1, port_feature::POWER).unwrap();
+            hub_shared.set_remote_wakeup(true);
+            port_array
+                .write_portsc(5, portsc::LWS | portsc::value::PLS_U3)
+                .unwrap();
+            assert_eq!(
+                port_array.read_portsc(5) & portsc::PLS,
+                portsc::value::PLS_U3
+            );
+            // The suspend reaches the worker before the attach does.
+            assert_eq!(control.list_devices().await.len(), 1);
+            assert!(interrupter.is_empty());
+
+            control.attach_at(path("5.1"), device(2, Speed::Full)).await;
+
+            assert_eq!(
+                port_array.read_portsc(5) & portsc::PLS,
+                portsc::value::PLS_RESUME
+            );
+            assert_eq!(
+                interrupter.await_event().await,
+                Some(EventTrb::new_port_status_change_event_trb(5))
+            );
+        }
+
+        #[tokio::test]
+        async fn a_hub_on_an_awake_root_port_does_not_wake_it() {
+            let (port_array, mut interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            control.attach_at(path("5"), hub_device).await;
+            interrupter.await_event().await;
+            hub_shared.set_port_feature(1, port_feature::POWER).unwrap();
+            hub_shared.set_remote_wakeup(true);
+
+            control.attach_at(path("5.1"), device(2, Speed::Full)).await;
+
+            assert_eq!(
+                port_array.read_portsc(5) & portsc::PLS,
+                portsc::value::PLS_POLLING
+            );
+            assert!(interrupter.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_device_on_a_root_port_cannot_be_suspended() {
+            let (port_array, mut interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            control.attach_at(path("6"), device(1, Speed::Full)).await;
+            interrupter.await_event().await;
+            port_array.write_portsc(6, portsc::PR).unwrap();
+            interrupter.await_event().await;
+
+            port_array
+                .write_portsc(6, portsc::LWS | portsc::value::PLS_U3)
+                .unwrap();
+
+            assert_eq!(
+                port_array.read_portsc(6) & portsc::PLS,
+                portsc::value::PLS_U0
+            );
         }
 
         #[tokio::test]

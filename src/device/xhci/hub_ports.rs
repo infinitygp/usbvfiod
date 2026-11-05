@@ -16,7 +16,10 @@
 //! The controller side, which attaches and detaches the devices below the hub, uses a
 //! [`HubHandle`]. The control and interrupt endpoints of the hub device use the same state.
 
-use std::sync::{Arc, Mutex, PoisonError, Weak};
+use std::{
+    fmt,
+    sync::{Arc, Mutex, PoisonError, Weak},
+};
 
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -67,11 +70,22 @@ struct Child {
     hub: Option<HubHandle>,
 }
 
-/// The port of the hub above that a hub is connected to.
+/// What a hub is connected to.
 #[derive(Debug, Clone)]
-struct Upstream {
-    hub: Weak<HubShared>,
-    port: u8,
+enum Upstream {
+    /// A port of a hub above.
+    Hub { hub: Weak<HubShared>, port: u8 },
+    /// A root port of the controller, which the controller wakes through this function.
+    Root(RootWakeup),
+}
+
+#[derive(Clone)]
+struct RootWakeup(Arc<dyn Fn() + Send + Sync>);
+
+impl fmt::Debug for RootWakeup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RootWakeup")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -154,7 +168,13 @@ pub struct HubShared {
 }
 
 impl HubShared {
+    /// A hub with 1 to 15 downstream ports, which is what the route string of the xHCI slot
+    /// context can address.
     pub fn new(ports: u8, speed: Speed) -> Self {
+        assert!(
+            (1..=15).contains(&ports),
+            "a hub has 1 to 15 ports, not {ports}"
+        );
         Self {
             ports,
             speed,
@@ -230,11 +250,14 @@ impl HubShared {
                 None
             }
         });
-        if let Some(parent) = upstream
-            .as_ref()
-            .and_then(|upstream| Some((upstream.hub.upgrade()?, upstream.port)))
-        {
-            parent.0.resume_from_below(parent.1);
+        match upstream {
+            Some(Upstream::Hub { hub, port }) => {
+                if let Some(parent) = hub.upgrade() {
+                    parent.resume_from_below(port);
+                }
+            }
+            Some(Upstream::Root(RootWakeup(wake))) => wake(),
+            None => {}
         }
     }
 
@@ -426,7 +449,7 @@ impl HubHandle {
     /// A device connects to a downstream port. `hub` is the state of the device if it is a hub.
     pub fn connect(&self, port: u8, speed: Speed, hub: Option<Self>) {
         if let Some(hub) = &hub {
-            hub.shared.set_upstream(Some(Upstream {
+            hub.shared.set_upstream(Some(Upstream::Hub {
                 hub: Arc::downgrade(&self.shared),
                 port,
             }));
@@ -478,6 +501,18 @@ impl HubHandle {
         if reported {
             self.shared.wake_upstream();
         }
+    }
+
+    /// The hub is on a root port of the controller, which it wakes with `wake` when the hub is
+    /// suspended and has remote wakeup.
+    pub fn connect_to_root_port(&self, wake: impl Fn() + Send + Sync + 'static) {
+        self.shared
+            .set_upstream(Some(Upstream::Root(RootWakeup(Arc::new(wake)))));
+    }
+
+    /// The root port of the hub was suspended or resumed.
+    pub fn set_suspended(&self, suspended: bool) {
+        self.shared.set_suspended(suspended);
     }
 
     /// The upstream port of the hub was reset, or the hub lost its power: it starts from scratch,
@@ -949,6 +984,34 @@ mod tests {
                 "lose_power={lose_power}"
             );
         }
+    }
+
+    #[test]
+    fn a_suspended_hub_on_a_root_port_wakes_the_root_port() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (hub, handle) = hub(4, Speed::High);
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let counter = wakeups.clone();
+        handle.connect_to_root_port(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        power(&hub, 1);
+        power(&hub, 2);
+
+        // Awake, or asleep without a wakeup armed: no signal.
+        handle.connect(1, Speed::Full, None);
+        handle.set_suspended(true);
+        handle.disconnect(1);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 0);
+
+        hub.set_remote_wakeup(true);
+        handle.connect(2, Speed::Full, None);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+
+        // The hub is awake after it signalled.
+        handle.disconnect(2);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

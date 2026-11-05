@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     Arc,
 };
 
@@ -29,9 +29,13 @@ pub struct PortscRegister {
     event_sender: EventSender,
     usb_version: UsbVersion,
     port_id: u8,
+    /// Whether a request for the link state U3 suspends the port. The device on a port does not
+    /// notice, so only a device that can wake the port itself, a hub, can be suspended.
+    suspend_supported: AtomicBool,
 }
 
-const BITMASK_RW1C: u64 = 0x00260000;
+/// CSC, PEC, PRC and PLC.
+const BITMASK_RW1C: u64 = 0x00660000;
 
 impl PortscRegister {
     pub const fn new(event_sender: EventSender, usb_version: UsbVersion, port_id: u8) -> Self {
@@ -40,7 +44,37 @@ impl PortscRegister {
             event_sender,
             usb_version,
             port_id,
+            suspend_supported: AtomicBool::new(false),
         }
+    }
+
+    /// Let the driver suspend the port (PORTSC.PLS = U3) and resume it again.
+    pub fn set_suspend_supported(&self, supported: bool) {
+        self.suspend_supported.store(supported, Ordering::Relaxed);
+    }
+
+    /// Whether the port is in the link state U3 (suspended).
+    pub fn is_suspended(&self) -> bool {
+        self.usb_version == UsbVersion::USB2 && self.read() & portsc::PLS == portsc::value::PLS_U3
+    }
+
+    /// The device on the port signals resume while the port is suspended. The port goes to the
+    /// resume state, and the driver learns about it with a port status change event.
+    ///
+    /// Returns whether the port was suspended.
+    pub fn remote_wakeup(&self) -> anyhow::Result<bool> {
+        let woke = self
+            .value
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |reg| {
+                (self.usb_version == UsbVersion::USB2 && reg & portsc::PLS == portsc::value::PLS_U3)
+                    .then_some(reg & !portsc::PLS | portsc::value::PLS_RESUME | portsc::PLC)
+            })
+            .is_ok();
+        if woke {
+            self.event_sender
+                .send(EventTrb::new_port_status_change_event_trb(self.port_id))?;
+        }
+        Ok(woke)
     }
 
     /// Write `value` to the register by overwriting the previously stored one.
@@ -67,39 +101,91 @@ impl PortscRegister {
     /// PR bit is handled by a custom logic path.
     /// All other bits are treated as read-only.
     pub fn write(&self, new_value: u64) -> anyhow::Result<()> {
-        if new_value & portsc::LWS != 0 {
-            // The link of a device behind this controller is up as long as the device is attached.
-            debug!(
-                "port {}: ignoring the request for link state {}",
-                self.port_id,
-                (new_value & portsc::PLS) >> 5
+        let requested_link_state =
+            (new_value & portsc::LWS != 0).then_some((new_value & portsc::PLS) >> 5);
+        if let Some(state) = requested_link_state {
+            trace!(
+                "port {}: the driver requests link state {state}",
+                self.port_id
             );
         }
-
         let bits_to_clear = new_value & BITMASK_RW1C;
         let port_reset_bit = new_value & portsc::PR != 0;
+        let apply = |reg: u64| {
+            let mut new_reg = reg & !bits_to_clear;
+
+            if port_reset_bit {
+                Self::port_reset(&mut new_reg, self.usb_version);
+            } else if let Some(state) = requested_link_state {
+                self.request_link_state(&mut new_reg, state);
+            }
+
+            new_reg
+        };
 
         match self.value.try_update(
             std::sync::atomic::Ordering::Relaxed,
             std::sync::atomic::Ordering::Relaxed,
-            |reg| {
-                let mut new_reg = reg & !bits_to_clear;
-
-                if port_reset_bit {
-                    Self::port_reset(&mut new_reg, self.usb_version);
-                }
-
-                Some(new_reg)
-            },
+            |reg| Some(apply(reg)),
         ) {
-            Ok(_) => {
-                if port_reset_bit {
+            Ok(previous) => {
+                // The end of a reset and the end of a resume are changes for the driver.
+                let resumed = !port_reset_bit
+                    && requested_link_state == Some(0)
+                    && self.usb_version == UsbVersion::USB2
+                    && matches!(
+                        previous & portsc::PLS,
+                        portsc::value::PLS_U3 | portsc::value::PLS_RESUME
+                    );
+                if port_reset_bit || resumed {
                     let event = EventTrb::new_port_status_change_event_trb(self.port_id);
                     self.event_sender.send(event)?;
                 }
                 Ok(())
             }
             Err(_) => unreachable!("update function never returns None"),
+        }
+    }
+
+    /// Follow the request of the driver for a link state, as far as the port has one.
+    ///
+    /// A USB 2 port that supports it goes to U3 on request while it is enabled, and back to U0
+    /// via the resume state, with a change of the link state at the end. The request for anything
+    /// else, and every request on a USB 3 port, is ignored: the link of a device behind this
+    /// controller is up as long as the device is attached.
+    fn request_link_state(&self, register: &mut u64, state: u64) {
+        let current = *register & portsc::PLS;
+        let requested = state << 5;
+        let enabled = *register & (portsc::CCS | portsc::PED) == portsc::CCS | portsc::PED;
+        let usb2 = self.usb_version == UsbVersion::USB2;
+        let next = match requested {
+            portsc::value::PLS_U3
+                if usb2
+                    && enabled
+                    && current == portsc::value::PLS_U0
+                    && self.suspend_supported.load(Ordering::Relaxed) =>
+            {
+                Some(portsc::value::PLS_U3)
+            }
+            portsc::value::PLS_RESUME if usb2 && current == portsc::value::PLS_U3 => {
+                Some(portsc::value::PLS_RESUME)
+            }
+            portsc::value::PLS_U0
+                if usb2
+                    && (current == portsc::value::PLS_U3
+                        || current == portsc::value::PLS_RESUME) =>
+            {
+                *register |= portsc::PLC;
+                Some(portsc::value::PLS_U0)
+            }
+            _ => None,
+        };
+        match next {
+            Some(link_state) => *register = *register & !portsc::PLS | link_state,
+            None => debug!(
+                "port {}: ignoring the request for link state {state}",
+                self.port_id
+            ),
         }
     }
 
@@ -499,6 +585,132 @@ mod tests {
             0x00000203,
             "writing 1 to bit 17 should clear the bit."
         );
+    }
+
+    /// A USB 2 port with a device behind it that the driver has enabled with a reset.
+    fn enabled_usb2_port(
+        suspend_supported: bool,
+    ) -> (
+        PortscRegister,
+        crate::device::xhci::interrupter::tests::testutils::MockInterrupter,
+    ) {
+        let (event_sender, interrupter) =
+            crate::device::xhci::interrupter::tests::testutils::MockInterrupter::new();
+        let reg = PortscRegister::new(event_sender, UsbVersion::USB2, 5);
+        reg.set_suspend_supported(suspend_supported);
+        reg.set(portsc::CCS | portsc::PP | (3 << 10) | portsc::value::PLS_POLLING);
+        reg.write(portsc::PR).unwrap();
+        assert_eq!(reg.read() & portsc::PED, portsc::PED);
+        (reg, interrupter)
+    }
+
+    fn write_link_state(reg: &PortscRegister, link_state: u64) {
+        reg.write(portsc::LWS | link_state).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_usb2_port_with_a_hub_suspends_and_resumes_on_request() {
+        let (reg, mut interrupter) = enabled_usb2_port(true);
+        assert!(interrupter.await_event().await.is_some(), "the reset");
+        assert!(!reg.is_suspended());
+
+        write_link_state(&reg, portsc::value::PLS_U3);
+        assert!(reg.is_suspended());
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_U3);
+        assert_eq!(reg.read() & portsc::PED, portsc::PED, "still enabled");
+        assert!(
+            interrupter.is_empty(),
+            "the driver caused the change itself"
+        );
+
+        // The resume signalling and its end, after which the driver is told once.
+        write_link_state(&reg, portsc::value::PLS_RESUME);
+        assert!(!reg.is_suspended());
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_RESUME);
+        assert!(interrupter.is_empty());
+        write_link_state(&reg, portsc::value::PLS_U0);
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_U0);
+        assert_eq!(reg.read() & portsc::PLC, portsc::PLC);
+        assert!(interrupter.await_event().await.is_some());
+
+        // The driver clears the change.
+        reg.write(portsc::PLC).unwrap();
+        assert_eq!(reg.read() & portsc::PLC, 0);
+        assert!(interrupter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_driver_can_resume_straight_to_u0() {
+        let (reg, mut interrupter) = enabled_usb2_port(true);
+        interrupter.await_event().await;
+        write_link_state(&reg, portsc::value::PLS_U3);
+
+        write_link_state(&reg, portsc::value::PLS_U0);
+
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_U0);
+        assert!(interrupter.await_event().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_port_without_a_hub_ignores_the_request_for_u3() {
+        let (reg, mut interrupter) = enabled_usb2_port(false);
+        interrupter.await_event().await;
+
+        write_link_state(&reg, portsc::value::PLS_U3);
+
+        assert!(!reg.is_suspended());
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_U0);
+    }
+
+    #[tokio::test]
+    async fn a_port_that_is_not_enabled_does_not_suspend() {
+        let (reg, mut interrupter) = enabled_usb2_port(true);
+        interrupter.await_event().await;
+        reg.set(portsc::CCS | portsc::PP | portsc::value::PLS_POLLING);
+
+        write_link_state(&reg, portsc::value::PLS_U3);
+
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_POLLING);
+    }
+
+    #[tokio::test]
+    async fn a_usb3_port_ignores_requests_for_a_link_state() {
+        let (event_sender, interrupter) =
+            crate::device::xhci::interrupter::tests::testutils::MockInterrupter::new();
+        let reg = PortscRegister::new(event_sender, UsbVersion::USB3, 1);
+        reg.set_suspend_supported(true);
+        reg.set(portsc::CCS | portsc::PED | portsc::PP);
+
+        write_link_state(&reg, portsc::value::PLS_U3);
+
+        assert!(!reg.is_suspended());
+        assert_eq!(reg.read(), portsc::CCS | portsc::PED | portsc::PP);
+        assert!(interrupter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_device_that_wakes_a_suspended_port_puts_it_in_the_resume_state() {
+        let (reg, mut interrupter) = enabled_usb2_port(true);
+        interrupter.await_event().await;
+
+        // An awake port has nothing to wake.
+        assert!(!reg.remote_wakeup().unwrap());
+        assert!(interrupter.is_empty());
+
+        write_link_state(&reg, portsc::value::PLS_U3);
+        assert!(reg.remote_wakeup().unwrap());
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_RESUME);
+        assert_eq!(reg.read() & portsc::PLC, portsc::PLC);
+        assert!(interrupter.await_event().await.is_some());
+        assert!(
+            !reg.remote_wakeup().unwrap(),
+            "the port is not suspended anymore"
+        );
+
+        // The driver ends the resume.
+        reg.write(portsc::PLC).unwrap();
+        write_link_state(&reg, portsc::value::PLS_U0);
+        assert_eq!(reg.read() & portsc::PLS, portsc::value::PLS_U0);
     }
 
     #[test]

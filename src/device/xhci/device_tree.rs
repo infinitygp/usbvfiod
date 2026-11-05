@@ -238,6 +238,18 @@ impl<CRD: CompleteRealDevice> DeviceTree<CRD> {
         }
     }
 
+    /// The root port of a hub was suspended or resumed.
+    pub fn set_root_hub_suspended(&self, root_port: u8, suspended: bool) {
+        if let Some(hub) = self
+            .roots
+            .get(usize::from(root_port))
+            .and_then(Option::as_ref)
+            .and_then(Node::hub_handle)
+        {
+            hub.set_suspended(suspended);
+        }
+    }
+
     /// The upstream port of a hub on a root port was reset.
     pub fn reset_hub_on_root_port(&self, root_port: u8) {
         if let Some(hub) = self

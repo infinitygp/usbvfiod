@@ -24,13 +24,17 @@ Most of this holds for every guest, but Windows is the first driver that exercis
 - A full event ring is reported with an Event Ring Full Error event in the last free slot. The
   events that did not fit wait until the driver advanced the dequeue pointer.
 - During a stop it writes `PORTSC.PLS = U3` with `LWS` set to the ports. The write is ignored and
-  the link state does not change.
+  the link state does not change, except for a USB 2 port with a hub on it (see below).
 - A Stop Endpoint command on an endpoint with a pending transfer is answered by a Transfer Event
   with the completion code Stopped for the TRB, before the completion of the command. Without it,
   Windows waits 2 seconds before it goes on. It stops the status change endpoint of an idle hub
   this way when it suspends the hub.
 - Windows suspends hubs that have no active device, and relies on the remote wakeup of the hub to
-  learn about a device that is plugged in later (see [Hubs and Port Paths](../users/hubs.md)).
+  learn about a device that is plugged in later (see [Hubs and Port Paths](../users/hubs.md)). When
+  the whole tree is idle, it suspends the root port of the top hub with `PORTSC.PLS = U3`. A USB 2 root
+  port with a hub on it goes to U3 on this request. When a device comes or goes below the hub, the
+  port goes to the resume state (`PLS = 15`, `PLC` set, port status change event), and the driver
+  ends the resume with `PLS = U0`. `PLC` is a write-1-to-clear bit.
 - It needs the USB 2 hub class requests of chapter 11 to answer in the states that the
   specification describes, and shows a hub with the speed of its device descriptor in USBView. A
   high speed hub below a full speed hub does not work, so the controller refuses it.

@@ -400,8 +400,10 @@ pub mod xhci {
             /// the field is larger than one bit.
             pub mod value {
                 pub const PLS_U0: u64 = 0x0;
+                pub const PLS_U3: u64 = 0x60;
                 pub const PLS_RXDETECT: u64 = 0xa0;
                 pub const PLS_POLLING: u64 = 0xe0;
+                pub const PLS_RESUME: u64 = 0x1e0;
             }
         }
     }
