@@ -12,7 +12,10 @@ mod xhci_backend;
 
 use std::{
     os::fd::{FromRawFd, OwnedFd},
+    path::PathBuf,
+    sync::Once,
     thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -21,11 +24,59 @@ use clap::Parser;
 use cli::Cli;
 use device::pcap::UsbPcapManager;
 use hotplug_server::run_hotplug_server;
+use signal_hook::{
+    consts::{SIGINT, SIGTERM},
+    iterator::Signals,
+};
+use tokio::runtime::Handle;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use vfio_user::Server;
 
-use crate::async_runtime::runtime;
+use crate::{
+    async_runtime::runtime,
+    device::xhci::{
+        any_device::ControllerDevice, nusb::claimed_host_devices, port::HotplugControl,
+    },
+};
+
+/// How long the host devices have to go back to the host when usbvfiod ends.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a cancelled transfer may hold its interface after its device was dropped.
+const RELEASE_SETTLE: Duration = Duration::from_millis(200);
+
+static RELEASE: Once = Once::new();
+
+/// Gives the host devices back to the host before the process ends: detaches every device and
+/// waits until the interfaces of the host devices are released, which binds their kernel drivers
+/// again. A process that just ends leaves them without a driver. The first caller does the work,
+/// a second one waits for it.
+fn release_devices(control: &HotplugControl<ControllerDevice>, async_runtime: &Handle) {
+    RELEASE.call_once(|| {
+        let held = claimed_host_devices();
+        async_runtime.block_on(async {
+            control.detach_all().await;
+            let deadline = Instant::now() + RELEASE_TIMEOUT;
+            while claimed_host_devices() > 0 && Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if held > 0 {
+                tokio::time::sleep(RELEASE_SETTLE).await;
+            }
+        });
+        match claimed_host_devices() {
+            0 => info!("Gave {held} host devices back to the host"),
+            left => warn!("{left} of {held} host devices were not released in time"),
+        }
+    });
+}
+
+fn remove_hotplug_socket(path: Option<&PathBuf>) {
+    if let Some(path) = path.filter(|path| path.exists()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -80,14 +131,32 @@ fn main() -> Result<()> {
             .unwrap();
     }
 
+    let control = backend.hotplug_control();
+    let mut signals =
+        Signals::new([SIGINT, SIGTERM]).context("Failed to set up the signal handler")?;
+    {
+        let (control, socket_path) = (backend.hotplug_control(), args.hotplug_socket_path.clone());
+        let runtime = runtime.clone();
+        thread::Builder::new()
+            .name("signals".to_string())
+            .spawn(move || {
+                if let Some(signal) = signals.forever().next() {
+                    info!("Ending on signal {signal}");
+                    release_devices(&control, &runtime);
+                    remove_hotplug_socket(socket_path.as_ref());
+                    std::process::exit(128 + signal);
+                }
+            })
+            .context("Failed to start the signal thread")?;
+    }
+
     info!("We're up!");
 
-    loop {
+    let outcome = loop {
         let result = server.run(&mut backend);
 
         if !args.reconnect {
-            result.context("Failed to start vfio-user server")?;
-            break;
+            break result.context("Failed to start vfio-user server");
         }
 
         match result {
@@ -96,13 +165,10 @@ fn main() -> Result<()> {
         }
         backend.disconnect();
         info!("Waiting for the next vfio-user client");
-    }
+    };
 
-    if let Some(hotplug_socket_path) = args.hotplug_socket_path {
-        if hotplug_socket_path.exists() {
-            let _ = std::fs::remove_file(&hotplug_socket_path);
-        }
-    }
+    release_devices(&control, runtime);
+    remove_hotplug_socket(args.hotplug_socket_path.as_ref());
 
-    Ok(())
+    outcome
 }

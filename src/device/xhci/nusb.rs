@@ -1,4 +1,13 @@
-use std::{fmt::Debug, future::Future, pin::Pin, sync::Arc, time::Duration};
+use std::{
+    fmt::Debug,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use anyhow::{anyhow, Error};
 use nusb::{
@@ -53,7 +62,27 @@ impl TryFrom<nusb::Device> for NusbDeviceWrapper {
             interfaces.push(device.detach_and_claim_interface(interface_number).wait()?);
         }
 
+        CLAIMED_HOST_DEVICES.fetch_add(1, Ordering::SeqCst);
         Ok(Self { device, interfaces })
+    }
+}
+
+/// The host devices whose interfaces usbvfiod holds.
+static CLAIMED_HOST_DEVICES: AtomicUsize = AtomicUsize::new(0);
+
+/// How many host devices usbvfiod holds: their kernel drivers are detached until they are
+/// dropped.
+pub fn claimed_host_devices() -> usize {
+    CLAIMED_HOST_DEVICES.load(Ordering::SeqCst)
+}
+
+impl Drop for NusbDeviceWrapper {
+    fn drop(&mut self) {
+        // Releasing an interface gives it back to the kernel driver that
+        // detach_and_claim_interface took it from. An endpoint's transfers that were cancelled
+        // hold their interface until the kernel returns them, a moment later.
+        self.interfaces.clear();
+        CLAIMED_HOST_DEVICES.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -353,16 +382,17 @@ fn extract_recipient_and_type(request_type: u8) -> (Recipient, ControlType) {
 
 pub struct NormalEndpointHandle<EpType: EndpointType + 'static, Dir: EndpointDirection + 'static> {
     id: u8,
-    device_wrapper: Arc<NusbDeviceWrapper>,
+    // Before the device: an endpoint holds its interface, which the device releases when it goes.
     endpoint: Option<Endpoint<EpType, Dir>>,
+    device_wrapper: Arc<NusbDeviceWrapper>,
 }
 
 impl<EpType: EndpointType, Dir: EndpointDirection> NormalEndpointHandle<EpType, Dir> {
     const fn new(id: u8, device_wrapper: Arc<NusbDeviceWrapper>) -> Self {
         Self {
             id,
-            device_wrapper,
             endpoint: None,
+            device_wrapper,
         }
     }
 }

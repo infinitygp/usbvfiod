@@ -581,6 +581,22 @@ impl<CRD: CompleteRealDevice> HotplugControl<CRD> {
             .expect("oneshot channel should always provide a message")
     }
 
+    /// Detach every device, a hub with the devices below it. Returns how many devices were on the
+    /// root ports.
+    pub async fn detach_all(&self) -> usize {
+        let roots: Vec<PortPath> = self
+            .tree()
+            .await
+            .into_iter()
+            .map(|node| node.path)
+            .filter(PortPath::is_root)
+            .collect();
+        for path in &roots {
+            self.detach_at(*path).await;
+        }
+        roots.len()
+    }
+
     /// All devices with their port paths, every hub before the devices below it.
     pub async fn tree(&self) -> Vec<TreeNode<CRD::ID>> {
         let (responder, response_recv) = oneshot::channel();
@@ -1131,6 +1147,27 @@ mod tests {
             third_token.cancel();
             eventually(async || (control.tree().await.len() == 1).then_some(())).await;
             assert_eq!(hub_shared.port_status(2).unwrap()[2] & 1, 1);
+        }
+
+        #[tokio::test]
+        async fn detaching_all_takes_every_hub_and_device_off_and_cancels_their_tokens() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, _) = hub(1, 4, Speed::High);
+            let child = device(2, Speed::Full);
+            let other = device(3, Speed::High);
+            let tokens = [&hub_device, &child, &other].map(|d| d.detach_token());
+            for (at, device) in [("5", hub_device), ("5.1", child), ("6", other)] {
+                assert_eq!(
+                    control.attach_at(path(at), device).await,
+                    Response::SuccessfulOperation
+                );
+            }
+
+            assert_eq!(control.detach_all().await, 2);
+            assert!(control.tree().await.is_empty());
+            assert!(tokens.iter().all(CancellationToken::is_cancelled));
+            assert_eq!(control.detach_all().await, 0);
         }
 
         #[tokio::test]
