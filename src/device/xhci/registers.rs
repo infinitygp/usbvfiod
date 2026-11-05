@@ -338,6 +338,7 @@ impl ErstbaRegister {
 #[derive(Debug, Default, Clone)]
 pub struct ErdpRegister {
     value: Arc<AtomicU64>,
+    notify: Arc<Notify>,
 }
 
 impl ErdpRegister {
@@ -351,6 +352,13 @@ impl ErdpRegister {
 
     pub fn write(&self, new_value: u64) {
         self.value.store(new_value, Ordering::Relaxed);
+        // A permit is kept if nobody waits right now, so a waiter cannot miss the write.
+        self.notify.notify_one();
+    }
+
+    /// Wait for the driver to write the register.
+    pub async fn write_notification(&self) {
+        self.notify.notified().await;
     }
 }
 

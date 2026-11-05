@@ -30,9 +30,9 @@ pub enum EventTrb {
     Transfer(TransferEventTrbData),
     CommandCompletion(CommandCompletionEventTrbData),
     PortStatusChange(PortStatusChangeEventTrbData),
+    HostController(HostControllerEventTrbData),
     //BandwidthRequest,
     //Doorbell,
-    //HostController,
     //DeviceNotification,
     //MfIndexWrap,
 }
@@ -53,6 +53,7 @@ impl EventTrb {
             Self::Transfer(data) => data.to_bytes(),
             Self::CommandCompletion(data) => data.to_bytes(),
             Self::PortStatusChange(data) => data.to_bytes(),
+            Self::HostController(data) => data.to_bytes(),
         };
         // set cycle bit
         trb_data[12] = (trb_data[12] & !0x1) | cycle_bit as u8;
@@ -163,6 +164,38 @@ impl PortStatusChangeEventTrbData {
         bytes[3] = self.port_id;
         bytes[11] = CompletionCode::Success.into();
         bytes[13] = PORT_STATUS_CHANGE_EVENT << 2;
+
+        bytes
+    }
+}
+
+/// Stores the relevant data for a Host Controller Event.
+///
+/// Do not use this struct directly, use EventTrb::new_event_ring_full_error_trb
+/// instead.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HostControllerEventTrbData {
+    completion_code: CompletionCode,
+}
+
+impl EventTrb {
+    /// Create a new Host Controller Event TRB that reports a full Event Ring.
+    ///
+    /// The XHCI spec describes this structure in Section 6.4.2.6 and the
+    /// condition in Section 4.9.4.
+    pub const fn new_event_ring_full_error_trb() -> Self {
+        Self::HostController(HostControllerEventTrbData {
+            completion_code: CompletionCode::EventRingFullError,
+        })
+    }
+}
+
+impl HostControllerEventTrbData {
+    fn to_bytes(&self) -> RawTrbBuffer {
+        let mut bytes = zeroed_trb_buffer();
+
+        bytes[11] = self.completion_code.into();
+        bytes[13] = HOST_CONTROLLER_EVENT << 2;
 
         bytes
     }
