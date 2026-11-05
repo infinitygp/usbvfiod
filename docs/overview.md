@@ -8,6 +8,7 @@ Hypervisor virtual machine. For a basic overview of the goals, see the
 ## For Users
 
 - [Basic Setup and Invocation](./users/basic.md)
+- [Using usbvfiod with QEMU](./users/qemu.md)
 - [Systemd Setup](./users/systemd.md)
 - [Security Considerations](./users/security.md)
 
@@ -21,3 +22,4 @@ professional support.
 - [Code Guidelines](./developers/guidelines.md)
 - [Interactive VM-Test Debugging](./developers/vm-test.md)
 - [Policy Daemon](./developers/policy_daemon.md)
+- [Windows Guests](./developers/windows-guests.md)
