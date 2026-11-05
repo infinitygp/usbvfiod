@@ -426,19 +426,18 @@ impl Slot {
         }
     }
 
+    /// Write the slot state and the USB device address to the output slot context. An addressed
+    /// device has the slot ID as its address (xHCI 4.6.5: the xHC assigns it, and drivers and
+    /// tools such as USBPcap tell devices apart by it); a device in the Default state has none.
     fn write_slot_state(&self) {
-        let (base_address, state) = match self.state {
+        let (base_address, state, device_address) = match self.state {
             // in Enabled we do not even know the address context where to write the state to
             SlotState::Enabled => panic!("called write_slot_state in Enabled state"),
-            SlotState::Default(base_address) => (base_address, slot_state::DEFAULT),
-            SlotState::Addressed(base_address) => (base_address, slot_state::ADDRESSED),
-            SlotState::Configured(base_address) => (base_address, slot_state::CONFIGURED),
+            SlotState::Default(base_address) => (base_address, slot_state::DEFAULT, 0),
+            SlotState::Addressed(base_address) => (base_address, slot_state::ADDRESSED, self.id),
+            SlotState::Configured(base_address) => (base_address, slot_state::CONFIGURED, self.id),
         };
-        let state_addr = base_address.wrapping_add(15);
-        self.dma_bus.write(
-            Request::new(state_addr, RequestSize::Size1),
-            (state << 3) as u64,
-        );
+        write_slot_state_and_address(&self.dma_bus, base_address, state, device_address);
     }
 
     fn endpoint_sender(&self, endpoint_id: u8) -> Option<&EndpointSender> {
@@ -456,8 +455,8 @@ impl Slot {
         // address device with BSR=1 transitions from Enabled to Default
         // address device with BSR=0 transitions from Enabled/Default to Addressed
         //
-        // we currently do not do address assigning to the device.
-        // Theoretically, our root-hub-port-based device identification could
+        // The address is the slot ID and goes only to the slot context: no SET_ADDRESS reaches
+        // the device. Theoretically, our root-hub-port-based device identification could
         // target an incorrect device (after quick detach--reattach).
 
         // TODO check that only EP0 is enabled
@@ -824,6 +823,23 @@ impl Slot {
     }
 }
 
+/// Slot context dword 3 has the USB Device Address in bits 7:0 and the Slot State in bits 31:27.
+fn write_slot_state_and_address(
+    dma_bus: &BusDeviceRef,
+    slot_context: u64,
+    state: u8,
+    device_address: u8,
+) {
+    dma_bus.write(
+        Request::new(slot_context.wrapping_add(12), RequestSize::Size1),
+        u64::from(device_address),
+    );
+    dma_bus.write(
+        Request::new(slot_context.wrapping_add(15), RequestSize::Size1),
+        u64::from(state << 3),
+    );
+}
+
 /// Merge dwords of a context in guest memory into another one.
 ///
 /// For each dword, the bits that are set in the corresponding entry of `fields` are taken from the
@@ -1113,6 +1129,26 @@ mod context_tests {
                 0x0003_0000,
             ]
         );
+    }
+
+    #[test]
+    fn the_slot_state_and_the_device_address_go_to_dword_3() {
+        // Reserved bits of dword 3 are cleared; dwords 0 to 2 stay.
+        let ram = ram_with_slot_contexts([0; 3], [0x0000_0041, 0x0005_0000, 0x0000_0102]);
+        ram.write_bulk(OUTPUT_SLOT_CONTEXT + 12, &0x0012_3400_u32.to_le_bytes());
+        let bus: BusDeviceRef = ram.clone();
+        let dword_3 = || {
+            let mut bytes = [0u8; 4];
+            ram.read_bulk(OUTPUT_SLOT_CONTEXT + 12, &mut bytes);
+            u32::from_le_bytes(bytes)
+        };
+
+        write_slot_state_and_address(&bus, OUTPUT_SLOT_CONTEXT, slot_state::ADDRESSED, 7);
+        assert_eq!(dword_3(), 0x1012_3407);
+        assert_eq!(output_dwords(&ram), [0x0000_0041, 0x0005_0000, 0x0000_0102]);
+
+        write_slot_state_and_address(&bus, OUTPUT_SLOT_CONTEXT, slot_state::DEFAULT, 0);
+        assert_eq!(dword_3(), 0x0812_3400);
     }
 
     #[test]
