@@ -875,4 +875,86 @@ mod tests {
         backend.disconnect();
         assert_eq!(dma_read(&backend, 0x1000), 0xff);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_client_on_the_socket_maps_memory_resets_and_unmaps() {
+        use std::os::fd::AsRawFd;
+
+        let socket_path =
+            std::env::temp_dir().join(format!("usbvfiod-test-{}", std::process::id()));
+        let mut backend = backend();
+        let server =
+            vfio_user::Server::new(&socket_path, true, backend.irqs(), backend.regions()).unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let result = server.run(&mut backend);
+            (result, backend)
+        });
+
+        let mut client = vfio_user::Client::new(&socket_path).unwrap();
+        assert_eq!(
+            client.region(VFIO_PCI_BAR0_REGION_INDEX).unwrap().size,
+            0x4000
+        );
+
+        // The memory of the client arrives as file descriptor.
+        let ram = memfd(0x4000, |offset| (offset / 0x1000) as u8 + 1);
+        client.dma_map(0, 0x10000, 0x4000, ram.as_raw_fd()).unwrap();
+
+        let mut vendor_and_device = [0u8; 4];
+        client
+            .region_read(VFIO_PCI_CONFIG_REGION_INDEX, 0, &mut vendor_and_device)
+            .unwrap();
+        assert_eq!(vendor_and_device, [0x36, 0x1b, 0x0d, 0x00]);
+
+        client
+            .region_write(
+                VFIO_PCI_BAR0_REGION_INDEX,
+                offset::DCBAAP,
+                &0x2000u32.to_le_bytes(),
+            )
+            .unwrap();
+        let mut dcbaap = [0u8; 8];
+        client
+            .region_read(VFIO_PCI_BAR0_REGION_INDEX, offset::DCBAAP, &mut dcbaap)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(dcbaap), 0x2000);
+
+        // The client enables the interrupt with an event file descriptor and disables it again.
+        client
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                0,
+                1,
+                &[ram.as_raw_fd()],
+            )
+            .unwrap();
+        client
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+                0,
+                0,
+                &[],
+            )
+            .unwrap();
+
+        client.reset().unwrap();
+        client
+            .region_read(VFIO_PCI_BAR0_REGION_INDEX, offset::DCBAAP, &mut dcbaap)
+            .unwrap();
+        assert_eq!(u64::from_le_bytes(dcbaap), 0);
+
+        // Unmap a page in the middle of the mapping, like QEMU does when it changes its memory map.
+        client.dma_unmap(0x11000, 0x1000).unwrap();
+
+        // Closing the connection ends the server and gives the backend back.
+        drop(client);
+        let (result, backend) = server_thread.join().unwrap();
+        result.unwrap();
+        assert_eq!(dma_read(&backend, 0x10000), 1);
+        assert_eq!(dma_read(&backend, 0x11000), 0xff);
+        assert_eq!(dma_read(&backend, 0x12000), 3);
+        assert!(!socket_path.exists(), "the server removes its socket");
+    }
 }
