@@ -159,10 +159,14 @@ impl<EH: HotplugEndpointHandle> EndpointWorker<EH> {
                     msg = self.recv.recv() => match msg.ok_or_else(|| anyhow!(""))? {
                         EndpointMessage::Stop(completion) => {
                             self.context.set_state(endpoint_state::STOPPED);
-                            let (dequeue_pointer,cycle_state) = self.transfer_ring.get_dequeue_pointer();
-                            self.context.set_dequeue_pointer_and_cycle_state(dequeue_pointer,cycle_state);
                             self.real_endpoint.cancel().await?;
-                            // TODO A Transfer Event with CompletionCode::Stopped and the residual length should be generated.
+                            // The endpoint handle works on a whole TD at a time, so the TD starts
+                            // over when the endpoint continues.
+                            if let Some((address, cycle_state)) = self.real_endpoint.take_restart_position() {
+                                self.transfer_ring.set_dequeue_pointer(address, cycle_state);
+                            }
+                            let (dequeue_pointer, cycle_state) = self.transfer_ring.get_dequeue_pointer();
+                            self.context.set_dequeue_pointer_and_cycle_state(dequeue_pointer, cycle_state);
                             self.state = WorkerState::StoppedWithContinuableTrb;
                             completion.send_anyhow(CompletionCode::Success)?;
                         }
@@ -313,5 +317,353 @@ impl EndpointSender {
         recv.await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::{
+        future::{pending, Future},
+        pin::Pin,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+
+    use tokio::time::timeout;
+
+    use super::*;
+    use crate::device::{
+        pcap::EndpointPcapMeta,
+        xhci::{
+            endpoint_handle::{ControlEndpointHandle, TdBasedInEndpointHandle},
+            hotplug_endpoint_handle::BaseEndpointHandle,
+            real_endpoint_handle::{
+                ControlRequestProcessingResult, InTrbProcessingResult, RealControlEndpointHandle,
+                RealInEndpointHandle,
+            },
+            trb::{testutils::RawTrbBuilder, RawTrb},
+            usbrequest::UsbRequest,
+        },
+    };
+
+    pub mod testutils {
+        use tokio::runtime::Handle;
+        use tokio_util::sync::CancellationToken;
+
+        use super::*;
+        use crate::{
+            device::{
+                bus::{testutils::TestBusDevice, BusDevice, BusDeviceRef, Request, RequestSize},
+                xhci::{
+                    endpoint_handle::EndpointHandle,
+                    hotplug_endpoint_handle::HotplugEndpointHandleImpl,
+                    interrupter::{tests::testutils::MockInterrupter, EventSender},
+                    slot_manager::EndpointContext,
+                    trb::EventTrb,
+                },
+            },
+            dynamic_bus::DynamicBus,
+        };
+
+        pub const SLOT_ID: u8 = 1;
+        pub const CONTEXT: u64 = 0x100;
+        pub const RING: u64 = 0x1000;
+        pub const BUFFER: u64 = 0x2000;
+
+        pub const NORMAL: u8 = 1;
+        pub const SETUP_STAGE: u8 = 2;
+        pub const DATA_STAGE: u8 = 3;
+        pub const STATUS_STAGE: u8 = 4;
+        pub const EVENT_DATA: u8 = 7;
+
+        /// The TRB at the `index`-th place of the ring, with the cycle bit of the first lap.
+        pub fn trb(index: u64, trb_type: u8) -> RawTrbBuilder {
+            RawTrbBuilder::new(RING + index * 16)
+                .with_trb_type(trb_type)
+                .with_cycle()
+        }
+
+        /// An endpoint worker on a transfer ring in guest memory.
+        pub struct Harness {
+            pub sender: EndpointSender,
+            pub interrupter: MockInterrupter,
+            pub bus: Arc<DynamicBus>,
+            pub endpoint_id: u8,
+        }
+
+        impl Harness {
+            /// The ring starts at `RING` with cycle state 1 and holds `trbs`. `make_handle` gets
+            /// the guest memory and the way to send events, and makes the endpoint handle that the
+            /// worker drives.
+            pub fn launch<EH: EndpointHandle>(
+                endpoint_id: u8,
+                trbs: &[RawTrb],
+                make_handle: impl FnOnce(BusDeviceRef, EventSender) -> EH,
+            ) -> Self {
+                let bus = Arc::new(DynamicBus::new());
+                bus.add(0, Arc::new(TestBusDevice::new(&[0u8; 0x4000])))
+                    .unwrap();
+                bus.write(Request::new(CONTEXT + 8, RequestSize::Size8), RING | 1);
+                for trb in trbs {
+                    bus.write_bulk(trb.address, &trb.buffer);
+                }
+
+                let (event_sender, interrupter) = MockInterrupter::new();
+                let runtime = Handle::current();
+                let handle = HotplugEndpointHandleImpl::new(
+                    SLOT_ID,
+                    endpoint_id,
+                    make_handle(bus.clone(), event_sender.clone()),
+                    event_sender,
+                    CancellationToken::new(),
+                    &runtime,
+                );
+                let sender = EndpointWorker::launch(
+                    &runtime,
+                    bus.clone(),
+                    handle,
+                    EndpointContext::new(CONTEXT, bus.clone()),
+                );
+                Self {
+                    sender,
+                    interrupter,
+                    bus,
+                    endpoint_id,
+                }
+            }
+
+            pub async fn stop(&self) -> CompletionCode {
+                let (completion, result) = oneshot::channel();
+                self.sender.stop(completion).unwrap();
+                timeout(Duration::from_secs(5), result)
+                    .await
+                    .expect("the Stop Endpoint command completes")
+                    .unwrap()
+            }
+
+            pub fn dequeue_pointer(&self) -> (u64, bool) {
+                EndpointContext::new(CONTEXT, self.bus.clone())
+                    .get_dequeue_pointer_and_cycle_state()
+            }
+
+            pub fn stopped(&self, pointer: u64, length: u32) -> EventTrb {
+                EventTrb::new_transfer_event_trb(
+                    pointer,
+                    length,
+                    CompletionCode::Stopped,
+                    false,
+                    self.endpoint_id,
+                    SLOT_ID,
+                )
+            }
+        }
+    }
+
+    use testutils::*;
+
+    /// What the real endpoints of the tests were asked to do.
+    #[derive(Debug, Default)]
+    struct Spy {
+        in_transfers: Mutex<Vec<usize>>,
+        control_requests: Mutex<Vec<UsbRequest>>,
+        cancels: AtomicUsize,
+    }
+
+    /// A real endpoint whose transfers never complete, like an interrupt endpoint without data.
+    #[derive(Debug)]
+    struct SlowIn(Arc<Spy>);
+
+    impl RealInEndpointHandle for SlowIn {
+        type TrbCompletionFuture<'a> =
+            Pin<Box<dyn Future<Output = anyhow::Result<InTrbProcessingResult>> + Send + 'a>>;
+
+        fn submit(&mut self, data: usize) -> anyhow::Result<()> {
+            self.0.in_transfers.lock().unwrap().push(data);
+            Ok(())
+        }
+
+        fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
+            Box::pin(pending())
+        }
+    }
+
+    impl BaseEndpointHandle for SlowIn {
+        type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+        fn cancel(&mut self) -> Self::CompletionFuture<'_> {
+            self.0.cancels.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A real control endpoint that never answers.
+    #[derive(Debug)]
+    struct SlowControl(Arc<Spy>);
+
+    impl RealControlEndpointHandle for SlowControl {
+        type TrbCompletionFuture<'a> = Pin<
+            Box<dyn Future<Output = anyhow::Result<ControlRequestProcessingResult>> + Send + 'a>,
+        >;
+
+        fn submit_control_request(&mut self, request: UsbRequest) -> anyhow::Result<()> {
+            self.0.control_requests.lock().unwrap().push(request);
+            Ok(())
+        }
+
+        fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_> {
+            Box::pin(pending())
+        }
+    }
+
+    impl BaseEndpointHandle for SlowControl {
+        type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
+
+        fn cancel(&mut self) -> Self::CompletionFuture<'_> {
+            self.0.cancels.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// An interrupt IN endpoint whose transfers never complete.
+    fn slow_in(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
+        let spy = Arc::new(Spy::default());
+        let endpoint_id = 3;
+        let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
+            TdBasedInEndpointHandle::new(
+                SLOT_ID,
+                endpoint_id,
+                EndpointPcapMeta::interrupt(1, SLOT_ID, endpoint_id),
+                SlowIn(spy.clone()),
+                bus,
+                event_sender,
+            )
+        });
+        (harness, spy)
+    }
+
+    /// A control endpoint that never answers.
+    fn slow_control(trbs: &[RawTrb]) -> (Harness, Arc<Spy>) {
+        let spy = Arc::new(Spy::default());
+        let endpoint_id = 1;
+        let harness = Harness::launch(endpoint_id, trbs, |bus, event_sender| {
+            ControlEndpointHandle::new(
+                SLOT_ID,
+                endpoint_id,
+                EndpointPcapMeta::control(1, SLOT_ID, endpoint_id),
+                SlowControl(spy.clone()),
+                bus,
+                event_sender,
+            )
+        });
+        (harness, spy)
+    }
+
+    async fn eventually(mut condition: impl FnMut() -> bool) {
+        for _ in 0..500 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the condition did not become true");
+    }
+
+    #[tokio::test]
+    async fn stopping_in_the_middle_of_a_td_rewinds_to_its_first_trb() {
+        // Two chained Normal TRBs of 100 and 60 bytes, and an Event Data TRB that ends the TD.
+        let (mut harness, spy) = slow_in(&[
+            trb(0, NORMAL)
+                .with_trb_transfer_length(100)
+                .with_data_pointer(BUFFER)
+                .with_chain()
+                .build(),
+            trb(1, NORMAL)
+                .with_trb_transfer_length(60)
+                .with_data_pointer(BUFFER + 100)
+                .with_chain()
+                .build(),
+            trb(2, EVENT_DATA)
+                .with_data_pointer(0xda7a)
+                .with_interrupt_on_completion()
+                .build(),
+        ]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| *spy.in_transfers.lock().unwrap() == [160]).await;
+
+        assert_eq!(harness.stop().await, CompletionCode::Success);
+
+        // Nothing was transferred, so the Stopped event is for the first TRB of the TD with all of
+        // its bytes left, and it is the only event.
+        assert_eq!(
+            harness.interrupter.await_event().await,
+            Some(harness.stopped(RING, 100))
+        );
+        assert!(harness.interrupter.is_empty());
+        assert_eq!(harness.dequeue_pointer(), (RING, true));
+        assert_eq!(spy.cancels.load(Ordering::SeqCst), 1);
+
+        // The doorbell starts the TD again from its first TRB.
+        harness.sender.doorbell().unwrap();
+        eventually(|| *spy.in_transfers.lock().unwrap() == [160, 160]).await;
+    }
+
+    #[tokio::test]
+    async fn stopping_a_single_trb_td_reports_that_trb() {
+        let (mut harness, spy) = slow_in(&[trb(0, NORMAL)
+            .with_trb_transfer_length(2)
+            .with_data_pointer(BUFFER)
+            .with_interrupt_on_completion()
+            .build()]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| *spy.in_transfers.lock().unwrap() == [2]).await;
+
+        assert_eq!(harness.stop().await, CompletionCode::Success);
+
+        assert_eq!(
+            harness.interrupter.await_event().await,
+            Some(harness.stopped(RING, 2))
+        );
+        assert!(harness.interrupter.is_empty());
+        assert_eq!(harness.dequeue_pointer(), (RING, true));
+    }
+
+    #[tokio::test]
+    async fn stopping_a_control_transfer_rewinds_to_its_setup_stage() {
+        let (mut harness, spy) = slow_control(&[
+            trb(0, SETUP_STAGE)
+                .with_immediate_data()
+                .with_trb_transfer_length(8)
+                .with_setup_type(0x80)
+                .with_setup_wlength(18)
+                .build(),
+            trb(1, DATA_STAGE)
+                .with_direction()
+                .with_trb_transfer_length(18)
+                .with_data_pointer(BUFFER)
+                .build(),
+            trb(2, STATUS_STAGE).with_interrupt_on_completion().build(),
+        ]);
+        harness.sender.doorbell().unwrap();
+        eventually(|| spy.control_requests.lock().unwrap().len() == 1).await;
+
+        assert_eq!(harness.stop().await, CompletionCode::Success);
+
+        assert_eq!(
+            harness.interrupter.await_event().await,
+            Some(harness.stopped(RING, 8))
+        );
+        assert!(harness.interrupter.is_empty());
+        assert_eq!(harness.dequeue_pointer(), (RING, true));
+
+        // The whole control transfer is sent to the device again, and only once.
+        harness.sender.doorbell().unwrap();
+        eventually(|| spy.control_requests.lock().unwrap().len() == 2).await;
+        let requests = spy.control_requests.lock().unwrap().clone();
+        assert_eq!(requests[0], requests[1]);
+        assert_eq!((requests[1].request_type, requests[1].length), (0x80, 18));
+        assert!(harness.interrupter.is_empty());
     }
 }

@@ -34,6 +34,15 @@ pub trait EndpointHandle: BaseEndpointHandle {
 
     fn submit_trb(&mut self, trb: RawTrb) -> anyhow::Result<()>;
     fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_>;
+
+    /// Whether the handle has taken TRBs of a transfer that it did not complete yet.
+    ///
+    /// A handle collects all TRBs of a TD, or of a control transfer, before it talks to the device.
+    /// The TRBs before the last one complete right away, but the transfer is not done, and an
+    /// endpoint that stops has to start over at its first TRB.
+    fn transfer_in_progress(&self) -> bool {
+        false
+    }
 }
 
 /// Possible result cases for processing of a TRB.
@@ -859,13 +868,23 @@ impl<RCEH: RealControlEndpointHandle> EndpointHandle for ControlEndpointHandle<R
             Ok(result)
         })
     }
+
+    fn transfer_in_progress(&self) -> bool {
+        !self.submission_state.trbs.is_empty()
+    }
 }
 
 impl<RCEH: RealControlEndpointHandle> BaseEndpointHandle for ControlEndpointHandle<RCEH> {
     type CompletionFuture<'a> = Pin<Box<dyn Future<Output = anyhow::Result<()>> + Send + 'a>>;
 
     fn cancel(&mut self) -> Self::CompletionFuture<'_> {
-        Box::pin(async { self.real_ep.cancel().await })
+        Box::pin(async {
+            // The TRBs of the transfer are fetched from the transfer ring again when the
+            // endpoint continues, so nothing of them is kept.
+            self.submission_state = ControlSubmission::default();
+            self.transfer_state = ControlTransfer::new(false, UsbRequest::default());
+            self.real_ep.cancel().await
+        })
     }
 }
 
@@ -978,6 +997,17 @@ enum TdBasedNormalSubmissionState {
 impl Default for TdBasedNormalSubmissionState {
     fn default() -> Self {
         Self::CollectingTd(vec![])
+    }
+}
+
+impl TdBasedNormalSubmissionState {
+    /// Whether TRBs of a TD were taken that the TD is not completed with.
+    const fn in_progress(&self) -> bool {
+        match self {
+            Self::CollectingTd(trbs) => !trbs.is_empty(),
+            Self::AwaitingRealTransfer(_) | Self::AwaitingLocalCompletion(_) => true,
+            Self::UnsupportedTrb(_) => false,
+        }
     }
 }
 
@@ -1176,6 +1206,10 @@ impl<RIEH: RealInEndpointHandle> EndpointHandle for TdBasedInEndpointHandle<RIEH
                 }
             }
         })
+    }
+
+    fn transfer_in_progress(&self) -> bool {
+        self.submission_state.in_progress()
     }
 }
 
@@ -1617,6 +1651,10 @@ impl<ROEH: RealOutEndpointHandle> EndpointHandle for TdBasedOutEndpointHandle<RO
                 }
             }
         })
+    }
+
+    fn transfer_in_progress(&self) -> bool {
+        self.submission_state.in_progress()
     }
 }
 

@@ -4,10 +4,13 @@ use tokio::{runtime, select, sync::Mutex};
 use tokio_util::sync::CancellationToken;
 use tracing::trace;
 
-use crate::device::xhci::{
-    endpoint_handle::{DummyEndpointHandle, EndpointHandle, TrbProcessingResult},
-    interrupter::EventSender,
-    trb::{CompletionCode, EventTrb, RawTrb},
+use crate::device::{
+    pci::constants::xhci::rings::trb_types,
+    xhci::{
+        endpoint_handle::{DummyEndpointHandle, EndpointHandle, TrbProcessingResult},
+        interrupter::EventSender,
+        trb::{CompletionCode, EventTrb, RawTrb},
+    },
 };
 
 // same as TrbProcessingResult but without the Disconnect variant.
@@ -50,6 +53,13 @@ pub trait HotplugEndpointHandle: BaseEndpointHandle {
 
     fn submit_trb(&mut self, trb: RawTrb) -> anyhow::Result<()>;
     fn next_completion(&mut self) -> Self::TrbCompletionFuture<'_>;
+
+    /// Where the transfer ring continues after [`BaseEndpointHandle::cancel`]: the address and
+    /// cycle state of the first TRB of the transfer that the cancel abandoned, if there was one.
+    ///
+    /// The endpoint handle works on a whole TD at a time, so an endpoint that stops does not
+    /// continue with the TRB it stopped at, but with the first TRB of its TD.
+    fn take_restart_position(&mut self) -> Option<(u64, bool)>;
 }
 
 #[derive(Debug)]
@@ -61,6 +71,11 @@ pub struct HotplugEndpointHandleImpl<EH: EndpointHandle> {
     notify_detach: CancellationToken,
     notify_drop: CancellationToken,
     submission_state: HotplugSubmissionState,
+    /// The first TRB of the transfer that the endpoint handle works on, which can be several TRBs
+    /// before the handle talks to the device.
+    transfer_start: Option<RawTrb>,
+    /// See [`HotplugEndpointHandle::take_restart_position`].
+    restart_position: Option<(u64, bool)>,
 }
 
 #[derive(Debug, Default)]
@@ -69,9 +84,37 @@ enum HotplugSubmissionState {
     NoTrbSubmitted,
     TrbSubmitted {
         address: u64,
-        /// The bytes the TRB transfers, which are left when the transfer is stopped.
-        transfer_length: u32,
     },
+}
+
+/// The Transfer Event of an endpoint that stopped in the transfer that starts with this TRB.
+///
+/// The endpoint handle did not start the transfer on the device as long as it collected the
+/// TRBs, and starts it again from the first TRB, so no byte of the TRB is transferred. The event
+/// names the TRB with its full length as the residual. The length of a TRB that does not transfer
+/// data is not valid.
+const fn stopped_event(first_trb: &RawTrb, endpoint_id: u8, slot_id: u8) -> EventTrb {
+    let (completion_code, residual_length) = match first_trb.buffer[13] >> 2 {
+        trb_types::NORMAL | trb_types::SETUP_STAGE | trb_types::DATA_STAGE | trb_types::ISOCH => {
+            // Bits 0 to 16 of the third dword of a transfer TRB.
+            let length = u32::from_le_bytes([
+                first_trb.buffer[8],
+                first_trb.buffer[9],
+                first_trb.buffer[10],
+                first_trb.buffer[11],
+            ]) & 0x1_ffff;
+            (CompletionCode::Stopped, length)
+        }
+        _ => (CompletionCode::StoppedLengthInvalid, 0),
+    };
+    EventTrb::new_transfer_event_trb(
+        first_trb.address,
+        residual_length,
+        completion_code,
+        false,
+        endpoint_id,
+        slot_id,
+    )
 }
 
 impl<EH: EndpointHandle> HotplugEndpointHandleImpl<EH> {
@@ -100,6 +143,8 @@ impl<EH: EndpointHandle> HotplugEndpointHandleImpl<EH> {
             notify_detach,
             notify_drop,
             submission_state: HotplugSubmissionState::NoTrbSubmitted,
+            transfer_start: None,
+            restart_position: None,
         }
     }
 
@@ -145,14 +190,11 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
         // with TRB address even if device is gone.
         self.submission_state = HotplugSubmissionState::TrbSubmitted {
             address: trb.address,
-            // Bits 0 to 16 of the third dword of a transfer TRB.
-            transfer_length: u32::from_le_bytes([
-                trb.buffer[8],
-                trb.buffer[9],
-                trb.buffer[10],
-                trb.buffer[11],
-            ]) & 0x1_ffff,
         };
+        self.restart_position = None;
+        if self.transfer_start.is_none() {
+            self.transfer_start = Some(trb.clone());
+        }
 
         if let Ok(mut guard) = self.endpoint_handle.try_lock() {
             if let Some(device) = guard.as_mut() {
@@ -188,14 +230,19 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
                     self.slot_id,
                 )
             };
+            let mut transfer_in_progress = false;
             let result = match self.endpoint_handle.lock().await.as_mut() {
                 Some(ep) => select! {
-                    result = ep.next_completion() => match result? {
-                        TrbProcessingResult::Disconnect => {
-                            self.notify_detach.cancel();
-                            HotplugTrbProcessingResult::TransactionError(None)
-                        },
-                        result => HotplugTrbProcessingResult::map_result(result),
+                    result = ep.next_completion() => {
+                        let result = match result? {
+                            TrbProcessingResult::Disconnect => {
+                                self.notify_detach.cancel();
+                                HotplugTrbProcessingResult::TransactionError(None)
+                            },
+                            result => HotplugTrbProcessingResult::map_result(result),
+                        };
+                        transfer_in_progress = ep.transfer_in_progress();
+                        result
                     },
                     _ = self.notify_detach.cancelled() => {
                         self.event_sender.send(event())?;
@@ -209,8 +256,15 @@ impl<EH: EndpointHandle> HotplugEndpointHandle for HotplugEndpointHandleImpl<EH>
             };
 
             self.submission_state = HotplugSubmissionState::NoTrbSubmitted;
+            if !transfer_in_progress {
+                self.transfer_start = None;
+            }
             Ok(result)
         })
+    }
+
+    fn take_restart_position(&mut self) -> Option<(u64, bool)> {
+        self.restart_position.take()
     }
 }
 
@@ -222,21 +276,17 @@ impl<EH: EndpointHandle> BaseEndpointHandle for HotplugEndpointHandleImpl<EH> {
             // The endpoint stops while the xHC works on a TRB. The xHC reports the TRB it stopped
             // on before the completion of the Stop Endpoint command (xHCI 4.6.9). A driver that
             // stops an endpoint with a pending transfer, like the one of a hub that is suspended,
-            // waits for this event.
-            if let HotplugSubmissionState::TrbSubmitted {
-                address,
-                transfer_length,
-            } = self.submission_state
+            // waits for this event. The transfer did not start on the device while its TRBs were
+            // collected, so it starts again from its first TRB, which the event names.
+            let first_trb = self.transfer_start.take();
+            if let (HotplugSubmissionState::TrbSubmitted { .. }, Some(first_trb)) =
+                (&self.submission_state, &first_trb)
             {
-                self.event_sender.send(EventTrb::new_transfer_event_trb(
-                    address,
-                    transfer_length,
-                    CompletionCode::Stopped,
-                    false,
-                    self.endpoint_id,
-                    self.slot_id,
-                ))?;
+                self.event_sender
+                    .send(stopped_event(first_trb, self.endpoint_id, self.slot_id))?;
             }
+            // Bit 0 of the fourth dword of a TRB is its cycle bit.
+            self.restart_position = first_trb.map(|trb| (trb.address, trb.buffer[12] & 1 != 0));
 
             if let Ok(mut guard) = self.endpoint_handle.try_lock() {
                 if let Some(device) = guard.as_mut() {
@@ -271,6 +321,8 @@ impl HotplugEndpointHandleImpl<DummyEndpointHandle> {
             notify_detach: CancellationToken::new(),
             // just a dummy; the drop implementation will notify, but nobody listens
             notify_drop: CancellationToken::new(),
+            transfer_start: None,
+            restart_position: None,
         }
     }
 }
@@ -282,29 +334,60 @@ mod tests {
         interrupter::tests::testutils::MockInterrupter, trb::testutils::RawTrbBuilder,
     };
 
-    #[tokio::test]
-    async fn stopping_an_endpoint_with_a_pending_transfer_reports_the_stopped_trb() {
-        let (event_sender, mut interrupter) = MockInterrupter::new();
-        let mut handle = HotplugEndpointHandleImpl::dummy(3, 5, event_sender);
-        let trb = RawTrbBuilder::new(0x1000)
-            .with_trb_type(1)
-            .with_trb_transfer_length(2)
-            .build();
+    #[test]
+    fn a_stopped_event_names_the_trb_with_all_of_its_bytes_left() {
+        for (trb_type, length) in [
+            (trb_types::NORMAL, 100),
+            (trb_types::SETUP_STAGE, 8),
+            (trb_types::DATA_STAGE, 18),
+            (trb_types::ISOCH, 1024),
+        ] {
+            let trb = RawTrbBuilder::new(0x1000)
+                .with_trb_type(trb_type)
+                .with_trb_transfer_length(length)
+                .build();
 
-        handle.submit_trb(trb).unwrap();
-        handle.cancel().await.unwrap();
+            assert_eq!(
+                stopped_event(&trb, 5, 3),
+                EventTrb::new_transfer_event_trb(
+                    0x1000,
+                    length,
+                    CompletionCode::Stopped,
+                    false,
+                    5,
+                    3
+                ),
+                "TRB type {trb_type}"
+            );
+        }
+    }
 
-        assert_eq!(
-            interrupter.await_event().await,
-            Some(EventTrb::new_transfer_event_trb(
-                0x1000,
-                2,
-                CompletionCode::Stopped,
-                false,
-                5,
-                3
-            ))
-        );
+    #[test]
+    fn the_length_of_a_trb_that_transfers_no_data_is_not_valid() {
+        // An Event Data TRB holds the high bits of its event data where the others hold a length.
+        for trb_type in [
+            trb_types::STATUS_STAGE,
+            trb_types::EVENT_DATA,
+            trb_types::NO_OP,
+        ] {
+            let trb = RawTrbBuilder::new(0x2000)
+                .with_trb_type(trb_type)
+                .with_byte(8, 0x77)
+                .build();
+
+            assert_eq!(
+                stopped_event(&trb, 5, 3),
+                EventTrb::new_transfer_event_trb(
+                    0x2000,
+                    0,
+                    CompletionCode::StoppedLengthInvalid,
+                    false,
+                    5,
+                    3
+                ),
+                "TRB type {trb_type}"
+            );
+        }
     }
 
     #[tokio::test]

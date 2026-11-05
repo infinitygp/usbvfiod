@@ -859,11 +859,18 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::device::xhci::{
-        any_device::{AnyDevice, ControllerDevice},
-        interrupter::tests::testutils::MockInterrupter,
-        port::PortArray,
-        real_device::{CompleteRealDevice, CompleteRealDeviceImpl, DeviceId},
+    use crate::device::{
+        bus::BusDevice,
+        pcap::EndpointPcapMeta,
+        xhci::{
+            any_device::{AnyDevice, ControllerDevice},
+            endpoint::tests::testutils::{trb, Harness, BUFFER, NORMAL, RING, SLOT_ID},
+            endpoint_handle::TdBasedInEndpointHandle,
+            interrupter::tests::testutils::MockInterrupter,
+            port::PortArray,
+            real_device::{CompleteRealDevice, CompleteRealDeviceImpl, DeviceId},
+            trb::{CompletionCode, EventTrb},
+        },
     };
     use usbvfiod::{hotplug_protocol::response::Response, usbip::STATUS_TRANSACTION_ERROR};
 
@@ -1471,6 +1478,75 @@ mod tests {
 
         let data = interrupt.next_completion().await.unwrap().data;
         assert_eq!(data, (0..64).collect::<Vec<u8>>());
+    }
+
+    /// An endpoint worker for the interrupt IN endpoint 1 of the device, with one TD of 8 bytes.
+    fn interrupt_worker(device: &ExternalDevice) -> Harness {
+        let endpoint_id = 3;
+        Harness::launch(
+            endpoint_id,
+            &[trb(0, NORMAL)
+                .with_trb_transfer_length(8)
+                .with_data_pointer(BUFFER)
+                .with_interrupt_on_completion()
+                .build()],
+            |bus, event_sender| {
+                TdBasedInEndpointHandle::new(
+                    SLOT_ID,
+                    endpoint_id,
+                    EndpointPcapMeta::interrupt(1, SLOT_ID, endpoint_id),
+                    device.interrupt_in_endpoint_handle(endpoint_id),
+                    bus,
+                    event_sender,
+                )
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn the_guest_stopping_the_endpoint_unlinks_the_transfer_and_the_td_starts_again() {
+        let (device, mut peer, detach) = device();
+        let mut worker = interrupt_worker(&device);
+        worker.sender.doorbell().unwrap();
+        let (first, _) = peer.submit().await;
+        assert_eq!((first.ep, first.direction), (1, Direction::In));
+
+        // The Stop Endpoint command waits for the answer to the unlink.
+        let (code, unlink) = tokio::join!(worker.stop(), async {
+            let unlink = peer.unlink().await;
+            peer.answer_unlink(unlink.seqnum, STATUS_CANCELLED).await;
+            unlink
+        });
+        assert_eq!(code, CompletionCode::Success);
+        assert_eq!(unlink.unlink_seqnum, first.seqnum);
+        assert_eq!(
+            worker.interrupter.await_event().await,
+            Some(worker.stopped(RING, 8))
+        );
+        assert!(worker.interrupter.is_empty());
+        assert_eq!(worker.dequeue_pointer(), (RING, true));
+
+        // The TD goes to the device again with a sequence number of its own.
+        worker.sender.doorbell().unwrap();
+        let (second, _) = peer.submit().await;
+        assert!(second.seqnum > unlink.seqnum);
+        assert_eq!((second.ep, second.transfer_buffer_length), (1, 8));
+        peer.complete(second.seqnum, 0, &[7; 8]).await;
+        assert_eq!(
+            worker.interrupter.await_event().await,
+            Some(EventTrb::new_transfer_event_trb(
+                RING,
+                0,
+                CompletionCode::Success,
+                false,
+                3,
+                SLOT_ID
+            ))
+        );
+        let mut report = [0u8; 8];
+        worker.bus.read_bulk(BUFFER, &mut report);
+        assert_eq!(report, [7; 8]);
+        assert!(!detach.is_cancelled());
     }
 
     #[tokio::test]
