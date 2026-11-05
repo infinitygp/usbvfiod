@@ -1,3 +1,4 @@
+pub mod any_device;
 pub mod command_ring;
 pub mod controller_reset;
 pub mod endpoint;

@@ -54,6 +54,23 @@ pub trait Identifier: Debug + Copy + Eq + Send + Sync + 'static {}
 
 impl Identifier for (u8, u8) {}
 
+/// The identifier of devices in a controller that serves devices of the host and emulated ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceId {
+    /// A device of the host, by bus and device number.
+    Host { bus: u8, device: u8 },
+}
+
+impl Identifier for DeviceId {}
+
+impl fmt::Display for DeviceId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Host { bus, device } => write!(f, "host {bus:03}:{device:03}"),
+        }
+    }
+}
+
 // A RealDevice trait coupled with an identifier and cancellation token for detach notification.
 //
 // A real device alone might not be able to identify itself. For example, a

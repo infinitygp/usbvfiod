@@ -26,9 +26,10 @@ use crate::device::{
     interrupt_line::{DummyInterruptLine, InterruptLine},
     pci::{constants::config_space, traits::PciDevice, xhci::XhciController},
     xhci::{
+        any_device::{AnyDevice, ControllerDevice},
         nusb::NusbRealDevice,
         port::HotplugControl,
-        real_device::{CompleteRealDevice, CompleteRealDeviceImpl},
+        real_device::{CompleteRealDevice, CompleteRealDeviceImpl, DeviceId},
     },
 };
 
@@ -97,7 +98,7 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
     }
 }
 
-impl XhciBackend<CompleteRealDeviceImpl<NusbRealDevice, (u8, u8)>> {
+impl XhciBackend<ControllerDevice> {
     pub async fn add_device_from_path(
         &self,
         path: impl AsRef<Path>,
@@ -121,7 +122,10 @@ impl XhciBackend<CompleteRealDeviceImpl<NusbRealDevice, (u8, u8)>> {
         let file = open_file("Failed to open USB device file after device reset")?;
         let device = nusb::Device::from_fd(file.into()).wait()?;
         let real_device = NusbRealDevice::try_new(device, async_runtime.clone())?;
-        let complete_device = CompleteRealDeviceImpl::new((bus, dev), real_device);
+        let complete_device = CompleteRealDeviceImpl::new(
+            DeviceId::Host { bus, device: dev },
+            AnyDevice::new(real_device),
+        );
         let response = self.hotplug_control().attach(complete_device).await;
         if response != Response::SuccessfulOperation {
             return Err(anyhow!(
