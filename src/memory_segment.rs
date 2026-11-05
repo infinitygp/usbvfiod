@@ -4,7 +4,7 @@
 use std::{
     fs::File,
     sync::{
-        atomic::{AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc,
     },
 };
@@ -293,6 +293,67 @@ impl BusDevice for MemorySegment {
             let atomic = unsafe { &*(base.add(tail_start + i) as *const AtomicU8) };
             atomic.store(*byte, Ordering::Relaxed);
         }
+    }
+}
+
+/// A DMA mapping the client did not give us a file descriptor for.
+///
+/// We can neither map nor otherwise reach its memory, so every access fails
+/// like a PCI access nobody answers: reads return all bits set and writes are
+/// dropped. This is logged once per mapping, because a driver that depends on
+/// such memory cannot work.
+#[derive(Debug)]
+pub struct UnbackedSegment {
+    size: u64,
+    address: u64,
+    warned: AtomicBool,
+}
+
+impl UnbackedSegment {
+    /// `address` is only used for log messages.
+    pub const fn new(address: u64, size: u64) -> Self {
+        Self {
+            size,
+            address,
+            warned: AtomicBool::new(false),
+        }
+    }
+
+    fn warn_once(&self, access: &str, offset: u64) {
+        if !self.warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "DMA {access} at {:#x} in the mapping at {:#x}+{:#x} that has no file descriptor, \
+                 which is not supported (the guest memory must be shared with this process)",
+                self.address.wrapping_add(offset),
+                self.address,
+                self.size
+            );
+        }
+    }
+}
+
+impl BusDevice for UnbackedSegment {
+    fn size(&self) -> u64 {
+        self.size
+    }
+
+    fn read(&self, req: Request) -> u64 {
+        self.warn_once("read", req.addr);
+        let bits = u8::from(req.size) * 8;
+        !0u64 >> (u64::BITS - u32::from(bits))
+    }
+
+    fn write(&self, req: Request, _value: u64) {
+        self.warn_once("write", req.addr);
+    }
+
+    fn read_bulk(&self, offset: u64, data: &mut [u8]) {
+        self.warn_once("read", offset);
+        data.fill(0xff);
+    }
+
+    fn write_bulk(&self, offset: u64, _data: &[u8]) {
+        self.warn_once("write", offset);
     }
 }
 

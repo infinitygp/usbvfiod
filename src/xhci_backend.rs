@@ -8,11 +8,12 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use nusb::MaybeFuture;
 use tokio::runtime;
-use tracing::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use usbvfiod::hotplug_protocol::{device_paths::resolve_path, response::Response};
 use vfio_bindings::bindings::vfio::{
-    vfio_region_info, VFIO_PCI_BAR0_REGION_INDEX, VFIO_PCI_BAR1_REGION_INDEX,
+    vfio_region_info, VFIO_IRQ_SET_ACTION_TRIGGER, VFIO_IRQ_SET_DATA_EVENTFD,
+    VFIO_IRQ_SET_DATA_NONE, VFIO_PCI_BAR0_REGION_INDEX, VFIO_PCI_BAR1_REGION_INDEX,
     VFIO_PCI_BAR2_REGION_INDEX, VFIO_PCI_BAR3_REGION_INDEX, VFIO_PCI_BAR4_REGION_INDEX,
     VFIO_PCI_BAR5_REGION_INDEX, VFIO_PCI_CONFIG_REGION_INDEX, VFIO_PCI_MSIX_IRQ_INDEX,
     VFIO_PCI_NUM_IRQS, VFIO_PCI_NUM_REGIONS, VFIO_REGION_INFO_FLAG_READ,
@@ -21,9 +22,9 @@ use vfio_bindings::bindings::vfio::{
 use vfio_user::{IrqInfo, ServerBackend, ServerRegion};
 
 use crate::device::{
-    bus::{Request, RequestSize},
+    bus::{BusDeviceRef, Request, RequestSize},
     interrupt_line::{DummyInterruptLine, InterruptLine},
-    pci::{traits::PciDevice, xhci::XhciController},
+    pci::{constants::config_space, traits::PciDevice, xhci::XhciController},
     xhci::{
         nusb::NusbRealDevice,
         port::HotplugControl,
@@ -31,7 +32,10 @@ use crate::device::{
     },
 };
 
-use crate::{dynamic_bus::DynamicBus, memory_segment::MemorySegment};
+use crate::{
+    dynamic_bus::DynamicBus,
+    memory_segment::{MemorySegment, UnbackedSegment},
+};
 
 #[derive(Debug)]
 pub struct XhciBackend<CRD: CompleteRealDevice> {
@@ -81,6 +85,17 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
 
     pub fn hotplug_control(&self) -> HotplugControl<CRD> {
         self.controller.hotplug_control()
+    }
+
+    /// Forget everything the client told us.
+    ///
+    /// This is what remains to do after the connection to the client closed: Guest memory and
+    /// interrupts are gone, and the controller must start from scratch for the next client.
+    pub fn disconnect(&self) {
+        self.dma_bus.clear();
+        self.controller
+            .connect_irq(Arc::new(DummyInterruptLine::default()));
+        self.controller.reset();
     }
 }
 
@@ -210,6 +225,96 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
     }
 }
 
+/// The size of the PCI Configuration Space region we report.
+const CONFIG_REGION_SIZE: u64 = config_space::SIZE as u64;
+
+/// The widest access we hand to the controller.
+const MAX_ACCESS_SIZE: usize = 4;
+
+impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
+    /// Read from a region, splitting what the controller cannot serve in one piece.
+    ///
+    /// Anything we cannot serve reads as all bits set, like a PCI access that nobody answers.
+    fn read_region(&self, region: u32, offset: u64, data: &mut [u8]) {
+        data.fill(0xff);
+
+        let region_size = match region {
+            VFIO_PCI_CONFIG_REGION_INDEX => CONFIG_REGION_SIZE,
+            VFIO_PCI_BAR0_REGION_INDEX => self.bar_size(0),
+            _ => 0,
+        };
+        let Ok(len) = u64::try_from(data.len()) else {
+            return;
+        };
+        if offset.checked_add(len).is_none_or(|end| end > region_size) {
+            debug!("read of region {region} offset {offset:#x}+{len} is out of bounds");
+            if region == VFIO_PCI_BAR3_REGION_INDEX {
+                // The pending bit array of MSI-X is in this region. We never keep an interrupt pending.
+                data.fill(0);
+            }
+            return;
+        }
+
+        // The registers of the xHC are 32 bits wide, and 64-bit registers consist of two of them.
+        // Splitting an 8-byte access is what the specification allows for a controller without
+        // 64-bit addressing.
+        for (index, chunk) in data.chunks_mut(MAX_ACCESS_SIZE).enumerate() {
+            let Ok(size) = RequestSize::try_from(chunk.len()) else {
+                debug!(
+                    "read of region {region} with unsupported size {}",
+                    chunk.len()
+                );
+                return;
+            };
+            let req = Request::new(offset + (index * MAX_ACCESS_SIZE) as u64, size);
+            let value = match region {
+                VFIO_PCI_CONFIG_REGION_INDEX => self.controller.read_cfg(req),
+                _ => self.controller.read_io(0, req),
+            };
+            chunk.copy_from_slice(&value.to_le_bytes()[0..chunk.len()]);
+        }
+    }
+
+    fn write_region(&self, region: u32, offset: u64, data: &[u8]) {
+        let region_size = match region {
+            VFIO_PCI_CONFIG_REGION_INDEX => CONFIG_REGION_SIZE,
+            VFIO_PCI_BAR0_REGION_INDEX => self.bar_size(0),
+            _ => 0,
+        };
+        let Ok(len) = u64::try_from(data.len()) else {
+            return;
+        };
+        if offset.checked_add(len).is_none_or(|end| end > region_size) {
+            debug!("write to region {region} offset {offset:#x}+{len} is out of bounds");
+            return;
+        }
+
+        for (index, chunk) in data.chunks(MAX_ACCESS_SIZE).enumerate() {
+            let Ok(size) = RequestSize::try_from(chunk.len()) else {
+                debug!(
+                    "write to region {region} with unsupported size {}",
+                    chunk.len()
+                );
+                return;
+            };
+            let req = Request::new(offset + (index * MAX_ACCESS_SIZE) as u64, size);
+            let mut value = [0u8; 8];
+            value[0..chunk.len()].copy_from_slice(chunk);
+            let value = u64::from_le_bytes(value);
+            match region {
+                VFIO_PCI_CONFIG_REGION_INDEX => self.controller.write_cfg(req, value),
+                _ => self.controller.write_io(0, req, value),
+            }
+        }
+    }
+
+    fn bar_size(&self, bar_no: u8) -> u64 {
+        self.controller
+            .bar(bar_no)
+            .map_or(0, |bar_info| bar_info.size.into())
+    }
+}
+
 impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
     fn region_read(
         &mut self,
@@ -217,25 +322,7 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
         offset: u64,
         data: &mut [u8],
     ) -> Result<(), std::io::Error> {
-        let value: u64 = match region {
-            VFIO_PCI_CONFIG_REGION_INDEX => self.controller.read_cfg(Request::new(
-                offset,
-                RequestSize::try_from(data.len() as u64).expect("should use valid request size"),
-            )),
-
-            0 => self.controller.read_io(
-                0,
-                Request::new(
-                    offset,
-                    RequestSize::try_from(data.len() as u64)
-                        .expect("should use valid request size"),
-                ),
-            ),
-
-            _ => !0u64,
-        };
-
-        data.copy_from_slice(&value.to_le_bytes()[0..data.len()]);
+        self.read_region(region, offset, data);
 
         trace!(
             "read region {region} offset {offset:#x}+{} val {:?}",
@@ -258,55 +345,7 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
             data
         );
 
-        match region {
-            VFIO_PCI_CONFIG_REGION_INDEX => self.controller.write_cfg(
-                Request::new(
-                    offset,
-                    RequestSize::try_from(data.len() as u64)
-                        .expect("should use valid request size"),
-                ),
-                match data.len() {
-                    1 => data[0].into(),
-                    2 => {
-                        // SAFETY:: this branch is only taken if data.len() == 2
-                        let val: [u8; 2] = data.try_into().unwrap();
-                        u16::from_le_bytes(val).into()
-                    }
-
-                    4 => {
-                        // SAFETY:: this branch is only taken if data.len() == 4
-                        let val: [u8; 4] = data.try_into().unwrap();
-                        u32::from_le_bytes(val).into()
-                    }
-                    _ => todo!(),
-                },
-            ),
-
-            0 => self.controller.write_io(
-                0,
-                Request::new(
-                    offset,
-                    RequestSize::try_from(data.len() as u64)
-                        .expect("should use valid request size"),
-                ),
-                match data.len() {
-                    1 => data[0].into(),
-                    2 => {
-                        // SAFETY:: this branch is only taken if data.len() == 2
-                        let val: [u8; 2] = data.try_into().unwrap();
-                        u16::from_le_bytes(val).into()
-                    }
-
-                    4 => {
-                        // SAFETY:: this branch is only taken if data.len() == 4
-                        let val: [u8; 4] = data.try_into().unwrap();
-                        u32::from_le_bytes(val).into()
-                    }
-                    _ => todo!(),
-                },
-            ),
-            _ => todo!(),
-        }
+        self.write_region(region, offset, data);
 
         Ok(())
     }
@@ -319,37 +358,70 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
         size: u64,
         fd: Option<File>,
     ) -> Result<(), std::io::Error> {
-        info!("dma_map flags = {flags:?} offset = {offset} address = {address} size = {size} fd = {fd:?}");
+        info!("dma_map flags = {flags:?} offset = {offset} address = {address:#x} size = {size:#x} fd = {fd:?}");
 
-        if let Some(fd) = fd {
-            let mseg = MemorySegment::new_from_fd(
-                &fd,
-                offset,
-                size,
-                // We want to know when this happens, so bail out eagerly here.
-                flags.try_into().expect("Failed to convert flags"),
-            )?;
+        let segment: BusDeviceRef = match fd {
+            Some(fd) => {
+                let access_rights = flags.try_into().map_err(|err| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("DMA map at {address:#x}: {err}"),
+                    )
+                })?;
+                Arc::new(MemorySegment::new_from_fd(
+                    &fd,
+                    offset,
+                    size,
+                    access_rights,
+                )?)
+            }
+            None => {
+                // Guest memory like ROMs and device memory the VMM does not share with other
+                // processes. A driver cannot use it as DMA buffer, as long as it comes from RAM that
+                // is shared.
+                warn!(
+                    "DMA mapping at {address:#x}+{size:#x} comes without a file descriptor and is not accessible"
+                );
+                Arc::new(UnbackedSegment::new(address, size))
+            }
+        };
 
-            // Guest provided invalid memory region setup - no reasonable recovery possible
-            self.dma_bus.add(address, Arc::new(mseg)).unwrap();
-        } else {
-            todo!("Memory region without file descriptor");
+        self.dma_bus.add(address, segment).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!("DMA map at {address:#x}+{size:#x}: {err}"),
+            )
+        })
+    }
+
+    fn dma_unmap(
+        &mut self,
+        flags: vfio_user::DmaUnmapFlags,
+        address: u64,
+        size: u64,
+    ) -> Result<(), std::io::Error> {
+        info!("dma_unmap flags = {flags:?} address = {address:#x} size = {size:#x}");
+
+        if flags.contains(vfio_user::DmaUnmapFlags::UNMAP_ALL) {
+            self.dma_bus.clear();
+            return Ok(());
+        }
+
+        // Like the Linux IOMMU API, unmapping a part of a mapping is fine, and so is unmapping what
+        // was never mapped.
+        let affected = self.dma_bus.remove_range(address, size);
+        if affected == 0 {
+            debug!("dma_unmap of {address:#x}+{size:#x} did not hit any mapping");
         }
 
         Ok(())
     }
 
-    fn dma_unmap(
-        &mut self,
-        _flags: vfio_user::DmaUnmapFlags,
-        _address: u64,
-        _size: u64,
-    ) -> Result<(), std::io::Error> {
-        todo!()
-    }
-
     fn reset(&mut self) -> Result<(), std::io::Error> {
-        todo!()
+        info!("Device reset requested");
+        self.controller.reset();
+
+        Ok(())
     }
 
     fn set_irqs(
@@ -364,26 +436,49 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
             "set IRQs: {index} flags: {flags:#x} start: {start:#x} count: {count:#x} #fds: {}",
             fds.len()
         );
-        assert_eq!(
-            index, VFIO_PCI_MSIX_IRQ_INDEX,
-            "Only MSI-X interrupts are supported"
-        );
-        assert!(count <= 1, "Only a single interrupt is supported");
 
-        let irqs: Vec<Arc<InterruptEventFd>> = fds
-            .into_iter()
-            .map(|file| {
-                Arc::new(InterruptEventFd {
-                    fd: Mutex::new(file),
-                })
-            })
-            .collect();
+        if index != VFIO_PCI_MSIX_IRQ_INDEX {
+            // We report no other interrupts, but a client may still switch them off.
+            debug!("ignoring IRQ configuration for index {index}");
+            return Ok(());
+        }
+
+        if flags & VFIO_IRQ_SET_ACTION_TRIGGER == 0 {
+            // Masking is up to the client: it only passes unmasked vectors to us.
+            debug!("ignoring IRQ configuration without trigger action");
+            return Ok(());
+        }
+
+        if flags & VFIO_IRQ_SET_DATA_NONE != 0 {
+            if count == 0 {
+                // Disable all vectors.
+                self.controller
+                    .connect_irq(Arc::new(DummyInterruptLine::default()));
+            } else {
+                debug!("ignoring request to trigger an interrupt");
+            }
+            return Ok(());
+        }
+
+        if flags & VFIO_IRQ_SET_DATA_EVENTFD == 0 {
+            debug!("ignoring IRQ configuration with unsupported data type");
+            return Ok(());
+        }
+
+        // The controller has a single interrupter, so there is only vector 0. The client sends
+        // either a file descriptor per vector or none for all vectors to disable.
+        if start != 0 || count == 0 {
+            debug!("ignoring IRQ configuration for vectors from {start} on");
+            return Ok(());
+        }
 
         // The solution offered by clippy produces a type error.
         #[allow(clippy::option_if_let_else)]
-        let irq: Arc<dyn InterruptLine> = match irqs.first() {
-            Some(eventfd) => eventfd.clone(),
-            _ => Arc::new(DummyInterruptLine::default()),
+        let irq: Arc<dyn InterruptLine> = match fds.into_iter().next() {
+            Some(file) => Arc::new(InterruptEventFd {
+                fd: Mutex::new(file),
+            }),
+            None => Arc::new(DummyInterruptLine::default()),
         };
 
         self.controller.connect_irq(irq);

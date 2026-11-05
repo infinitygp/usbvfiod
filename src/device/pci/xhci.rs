@@ -2,16 +2,21 @@
 //!
 //! See XHCI specification Section 3 for an overview about the scope of the xHC.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
 
 use tokio::runtime;
+use tracing::{debug, error, warn};
 
 use crate::device::{
     bus::{BusDeviceRef, SingleThreadedBusDevice},
     interrupt_line::InterruptLine,
     pci::{
         config_space::{ConfigSpace, ConfigSpaceBuilder},
-        constants::xhci::{offset, MAX_INTRS, RUN_BASE},
+        constants::xhci::{offset, operational::usbcmd, MAX_INTRS, RUN_BASE},
         traits::PciDevice,
     },
     xhci::{
@@ -25,6 +30,9 @@ use crate::device::{
 };
 use crate::device::{pci::constants::xhci::capability, xhci::command_ring::CommandRing};
 use crate::device::{pci::constants::xhci::OP_BASE, xhci::interrupter::Interrupter};
+
+/// How long we wait for a Host Controller Reset to finish.
+const RESET_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub struct XhciController<CRD: CompleteRealDevice> {
@@ -94,6 +102,25 @@ impl<CRD: CompleteRealDevice> XhciController<CRD> {
             .config_space()
     }
 
+    /// Reset the controller the way a client resets a PCI function.
+    ///
+    /// The PCI Configuration Space returns to its initial state and the xHC goes through a Host
+    /// Controller Reset. The attached devices stay where they are.
+    pub fn reset(&self) {
+        *self.config_space.lock().unwrap() = Self::build_config_space();
+
+        self.usbcmd.write(usbcmd::HCRST);
+
+        let deadline = Instant::now() + RESET_TIMEOUT;
+        while self.usbcmd.read() & usbcmd::HCRST != 0 {
+            if Instant::now() >= deadline {
+                error!("Host Controller Reset did not complete");
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
     pub fn connect_irq(&self, irq: Arc<dyn InterruptLine>) {
         self.interrupter
             .set_interrupt_line(irq)
@@ -102,6 +129,13 @@ impl<CRD: CompleteRealDevice> XhciController<CRD> {
 
     pub fn hotplug_control(&self) -> HotplugControl<CRD> {
         self.port_array.create_hotplug_control()
+    }
+}
+
+/// We do not support 64-bit addressing, so the upper half of an address register is zero.
+fn ignore_upper_address_half(register: &str, value: u64) {
+    if value != 0 {
+        warn!("ignoring {value:#x} written to the upper half of {register}, there is no support for addresses above 4G");
     }
 }
 
@@ -125,14 +159,18 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
         match req.addr {
             // xHC Operational Registers
             offset::USBCMD => self.usbcmd.write(value),
-            offset::DNCTL => assert_eq!(value, 2, "debug notifications not supported"),
+            offset::DNCTL => {
+                if value != 2 {
+                    debug!("ignoring write of {value:#x} to DNCTL, device notifications are not supported");
+                }
+            }
             offset::CRCR => self
                 .command_ring
                 .control(value)
                 .expect("command worker should be alive"),
-            offset::CRCR_HI => assert_eq!(value, 0, "no support for configuration above 4G"),
+            offset::CRCR_HI => ignore_upper_address_half("CRCR", value),
             offset::DCBAAP => self.slot_manager.dcbaap.write(value),
-            offset::DCBAAP_HI => assert_eq!(value, 0, "no support for configuration above 4G"),
+            offset::DCBAAP_HI => ignore_upper_address_half("DCBAAP", value),
             offset::CONFIG => self.slot_manager.config_reg.write(value as u32), // guard.enable_slots(value),
             // USBSTS writes occur but we can ignore them (to get a device enumerated)
             offset::USBSTS => {}
@@ -147,13 +185,13 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
                 self.interrupter.registers.erst_size.write(value);
             }
             offset::ERSTBA => self.interrupter.registers.erst_base_address.write(value),
-            offset::ERSTBA_HI => assert_eq!(value, 0, "no support for configuration above 4G"),
+            offset::ERSTBA_HI => ignore_upper_address_half("ERSTBA", value),
             offset::ERDP => self
                 .interrupter
                 .registers
                 .eventring_dequeue_pointer
                 .write(value),
-            offset::ERDP_HI => assert_eq!(value, 0, "no support for configuration above 4G"),
+            offset::ERDP_HI => ignore_upper_address_half("ERDP", value),
             offset::DOORBELL_CONTROLLER => self
                 .command_ring
                 .doorbell()
@@ -180,7 +218,7 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
             }
 
             addr => {
-                todo!("unknown write {}", addr);
+                debug!("ignoring write of {value:#x} to unknown register {addr:#x}");
             }
         }
     }
@@ -259,7 +297,8 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
 
             // Everything else is Reserved Zero
             addr => {
-                todo!("unknown read {}", addr);
+                debug!("read of unknown register {addr:#x}");
+                0
             }
         }
     }
