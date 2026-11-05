@@ -14,8 +14,9 @@ Most of this holds for every guest, but Windows is the first driver that exercis
 - It reads and writes the MMIO registers with 32-bit accesses. The client may split or merge
   accesses, so every access size up to 8 bytes is served.
 - After a Host Controller Reset the port registers start from scratch and a connected device
-  appears as newly connected. Windows enumerates a device that was attached before the driver
-  started, and one that stays attached over a guest reboot, from the port registers.
+  appears as newly connected, with `USBSTS.PCD` set. Windows enumerates a device that was attached
+  before the driver started, and one that stays attached over a guest reboot, from the port
+  registers.
 - `USBSTS.EINT` and `IMAN.IP` are set when an event is put on the event ring and are cleared by
   writing 1. `USBSTS.PCD` is set for every port status change event, including one that was
   generated before the driver configured the event ring. The interrupt is only raised while

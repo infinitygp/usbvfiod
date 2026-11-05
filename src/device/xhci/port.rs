@@ -187,7 +187,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
                     responder.send_anyhow(device)?;
                 }
                 PortMessage::ResetPorts(completion) => {
-                    self.reset_ports();
+                    self.reset_ports()?;
                     completion.send_anyhow(())?;
                 }
             };
@@ -254,9 +254,10 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
     /// Bring the port registers into the state a Host Controller Reset leaves them in.
     ///
     /// A device that is still connected shows up as freshly connected, like on a real controller
-    /// that detects the device after the reset. No event is sent because the driver sets up the
-    /// event ring anew and looks at the ports on its own.
-    fn reset_ports(&self) {
+    /// that detects the device after the reset. The event for it reaches the interrupter after its
+    /// reset. It cannot go onto an event ring yet, but it sets USBSTS.PCD for the driver, which
+    /// also looks at the ports on its own.
+    fn reset_ports(&self) -> anyhow::Result<()> {
         for port_id in 1..=MAX_PORTS as usize {
             let speed = self.devices[port_id]
                 .as_ref()
@@ -266,7 +267,14 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             });
             self.portsc[port_id].set(value);
             self.portpmsc[port_id].write(0);
+
+            if speed.is_some() {
+                let event = EventTrb::new_port_status_change_event_trb(port_id as u8);
+                self.event_sender.send(event)?;
+            }
         }
+
+        Ok(())
     }
 
     fn attached_devices(&self) -> Vec<CRD::ID> {
@@ -600,6 +608,11 @@ mod tests {
         // The connected device is found as new.
         assert_eq!(port_array.read_portsc(PORT_ID as usize), connected);
         assert_eq!(port_array.read_portpmsc(PORT_ID as usize), 0);
+        assert_eq!(
+            interrupter.await_event().await,
+            Some(EventTrb::new_port_status_change_event_trb(PORT_ID)),
+            "the interrupter learns about the connected device"
+        );
         // An empty port went back to its initial state.
         assert_eq!(
             port_array.read_portsc(2),

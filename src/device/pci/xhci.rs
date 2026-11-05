@@ -552,4 +552,38 @@ mod tests {
         let portsc = controller.read_io(0, Request::new(offset::PORTSC, RequestSize::Size4));
         assert_eq!(portsc & portsc::CCS, portsc::CCS);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn after_a_reset_a_connected_device_is_new_and_the_driver_is_told_about_the_change() {
+        let mut driver = Driver::new().await;
+        let device = CompleteRealDeviceImpl::new((1, 1), MockRealDevice::default());
+        driver.controller.hotplug_control().attach(device).await;
+        driver.next_event().await;
+
+        // The driver enumerated the device and acknowledged everything.
+        driver.write32(
+            offset::PORTSC,
+            (portsc::CSC | portsc::PEC | portsc::PRC) as u32,
+        );
+        driver.write32(offset::USBSTS, (usbsts::EINT | usbsts::PCD) as u32);
+        assert_eq!(driver.read32(offset::USBSTS) & usbsts::PCD as u32, 0);
+        assert_eq!(driver.read32(offset::PORTSC) & portsc::CSC as u32, 0);
+
+        // The device is still connected when the guest comes back from a reset.
+        driver.controller.reset();
+        sleep(Duration::from_millis(50)).await;
+
+        let portsc = driver.read32(offset::PORTSC);
+        assert_eq!(portsc & portsc::CCS as u32, portsc::CCS as u32);
+        assert_eq!(portsc & portsc::CSC as u32, portsc::CSC as u32);
+        assert_eq!(
+            driver.read32(offset::USBSTS) & usbsts::PCD as u32,
+            usbsts::PCD as u32
+        );
+        assert_eq!(
+            driver.read32(offset::USBSTS) & usbsts::EINT as u32,
+            0,
+            "no event went onto a ring"
+        );
+    }
 }
