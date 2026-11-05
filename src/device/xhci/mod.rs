@@ -15,3 +15,5 @@ pub mod registers;
 pub mod slot_manager;
 pub mod trb;
 pub mod usbrequest;
+#[cfg(test)]
+pub mod virtual_hid;

@@ -957,4 +957,68 @@ mod tests {
         assert_eq!(dma_read(&backend, 0x12000), 3);
         assert!(!socket_path.exists(), "the server removes its socket");
     }
+
+    /// Serves a virtual HID device to a vfio-user client until the process is killed.
+    ///
+    /// This is for checks with a real guest when no hardware is at hand:
+    ///
+    /// ```console
+    /// $ USBVFIOD_TEST_SOCKET=$PWD/S cargo test serve_a_virtual_hid_to_a_guest -- --ignored --nocapture
+    /// ```
+    ///
+    /// With `USBVFIOD_TEST_FLAP_SECS=N` the device is detached and attached again every N seconds.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "runs until it is killed"]
+    async fn serve_a_virtual_hid_to_a_guest() {
+        use crate::device::xhci::virtual_hid::VirtualHid;
+
+        let socket_path = std::env::var_os("USBVFIOD_TEST_SOCKET")
+            .expect("USBVFIOD_TEST_SOCKET names the socket to listen on");
+        let flap_interval = std::env::var("USBVFIOD_TEST_FLAP_SECS")
+            .ok()
+            .map(|secs| std::time::Duration::from_secs(secs.parse().unwrap()));
+
+        let subscriber = tracing_subscriber::FmtSubscriber::builder()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+
+        let mut backend = XhciBackend::<CompleteRealDeviceImpl<VirtualHid, (u8, u8)>>::new(
+            runtime::Handle::current(),
+        )
+        .unwrap();
+        let hotplug_control = backend.hotplug_control();
+        async fn attach(control: &HotplugControl<CompleteRealDeviceImpl<VirtualHid, (u8, u8)>>) {
+            let device = CompleteRealDeviceImpl::new((9, 9), VirtualHid);
+            info!("attach: {:?}", control.attach(device).await);
+        }
+        attach(&hotplug_control).await;
+
+        if let Some(interval) = flap_interval {
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(interval).await;
+                    info!("detach: {:?}", hotplug_control.detach((9, 9)).await);
+                    tokio::time::sleep(interval).await;
+                    attach(&hotplug_control).await;
+                }
+            });
+        }
+
+        let server = vfio_user::Server::new(
+            std::path::Path::new(&socket_path),
+            true,
+            backend.irqs(),
+            backend.regions(),
+        )
+        .unwrap();
+        loop {
+            info!(
+                "serve: {:?}",
+                server.run(&mut backend).map_err(|e| e.to_string())
+            );
+            backend.disconnect();
+        }
+    }
 }
