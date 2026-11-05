@@ -296,7 +296,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             self.event_sender.send(event)?;
         }
 
-        info!("Attached {speed} device {identifier:?} at port path {path} ({version:?} root port)");
+        info!("Attached {speed} device {identifier:?} at port path {path}");
 
         Ok(Response::SuccessfulOperation)
     }
