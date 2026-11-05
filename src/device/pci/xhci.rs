@@ -442,6 +442,11 @@ mod tests {
                 self.ram.read_bulk(self.next_event, &mut trb);
                 if (trb[12] & 1 != 0) == self.event_cycle {
                     self.next_event += 16;
+                    if self.next_event == EVENT_RING + u64::from(EVENT_RING_TRBS) * 16 {
+                        // The ring wraps around, and the cycle state of the controller flips.
+                        self.next_event = EVENT_RING;
+                        self.event_cycle = !self.event_cycle;
+                    }
                     // Tell the controller that we are done with the event.
                     self.write32(offset::ERDP, self.next_event as u32 | 0x8);
                     return trb;
@@ -482,6 +487,28 @@ mod tests {
         driver.write32(offset::IMAN, 0x3);
         assert_eq!(driver.read32(offset::IMAN), 0x2);
         assert_eq!(driver.read32(offset::USBSTS) & usbsts::EINT as u32, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_controller_offers_32_device_slots() {
+        let mut driver = Driver::new().await;
+        assert_eq!(driver.read32(offset::HCSPARAMS1) & 0xff, 32);
+
+        // The driver enables all slots and the controller keeps the value.
+        driver.write32(offset::CONFIG, 32);
+        assert_eq!(driver.read32(offset::CONFIG) & 0xff, 32);
+
+        for expected_slot in 1..=33u8 {
+            driver.ring_command(trb_types::ENABLE_SLOT_COMMAND);
+            let event = driver.next_event().await;
+            assert_eq!(event[13] >> 2, trb_types::COMMAND_COMPLETION_EVENT);
+            if expected_slot <= 32 {
+                assert_eq!(event[11], 1, "slot {expected_slot} is enabled");
+                assert_eq!(event[15], expected_slot, "the slot ID");
+            } else {
+                assert_eq!(event[11], 9, "No Slots Available Error");
+            }
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]

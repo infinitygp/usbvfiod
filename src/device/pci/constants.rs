@@ -220,7 +220,11 @@ pub mod xhci {
     /// Maximum number of supported interrupter register sets.
     pub const MAX_INTRS: u64 = 1;
     /// Maximum number of supported device slots.
-    pub const MAX_SLOTS: u64 = 8;
+    ///
+    /// The device doorbells (`DOORBELL_DEVICE` up to `DOORBELL_DEVICE_END`) have to fit between
+    /// the controller doorbell and the runtime registers at `RUN_BASE`, and the slot ID of a TRB
+    /// has 8 bits.
+    pub const MAX_SLOTS: u64 = 32;
     /// Maximum Event Ring Segment Table size as an exponent.
     ///
     /// The actual maximum number of segments is 2^MAX_ERST_SIZE_EXP.
@@ -288,6 +292,12 @@ pub mod xhci {
         pub const DOORBELL_DEVICE: u64 = 0x2004;
         pub const DOORBELL_DEVICE_END: u64 = DOORBELL_DEVICE + super::MAX_SLOTS * 4;
     }
+
+    const _: () = assert!(
+        offset::DOORBELL_DEVICE_END <= RUN_BASE,
+        "the device doorbells overlap the runtime registers"
+    );
+    const _: () = assert!(MAX_SLOTS <= 255, "a slot ID has 8 bits");
 
     /// Constants for the capability register.
     pub mod capability {
