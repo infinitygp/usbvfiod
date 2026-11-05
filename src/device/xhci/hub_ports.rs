@@ -350,16 +350,19 @@ impl HubShared {
                     }
                 }
                 port_feature::SUSPEND => {
-                    if port.is_enabled() {
+                    // Only a hub below the port can resume it, by remote wakeup. A device that
+                    // could not wake the bus, like an external device or one of the host, would
+                    // sleep for good, so its port stays active like a root port without a hub
+                    // does. The request succeeds, and the status shows the port not suspended.
+                    let hub = port
+                        .child
+                        .as_ref()
+                        .filter(|_| port.is_enabled())
+                        .and_then(|child| child.hub.clone());
+                    if hub.is_some() {
                         port.suspended = true;
-                        Ok(port
-                            .child
-                            .as_ref()
-                            .and_then(|child| child.hub.clone())
-                            .map(HubBelow::Suspend))
-                    } else {
-                        Ok(None)
                     }
+                    Ok(hub.map(HubBelow::Suspend))
                 }
                 port_feature::ENABLE => {
                     if port.connected() {
@@ -705,10 +708,11 @@ mod tests {
     }
 
     #[test]
-    fn suspend_and_resume_of_an_enabled_port() {
+    fn suspend_and_resume_of_an_enabled_port_with_a_hub() {
         let (shared, handle) = hub(4, Speed::High);
+        let (_, inner) = hub(4, Speed::High);
         power(&shared, 1);
-        handle.connect(1, Speed::High, None);
+        handle.connect(1, Speed::High, Some(inner));
 
         // A port that is not enabled does not suspend.
         shared.set_port_feature(1, port_feature::SUSPEND).unwrap();
@@ -725,6 +729,24 @@ mod tests {
         let (status, changes) = status(&shared, 1);
         assert_eq!(status & port_status::SUSPEND, 0);
         assert_eq!(changes & port_change::SUSPEND, port_change::SUSPEND);
+    }
+
+    #[test]
+    fn a_port_with_a_device_that_cannot_wake_the_bus_does_not_suspend() {
+        // Only a hub below the port can resume it. A device that would sleep for good, like an
+        // external device or one of the host, keeps its port active, and the request succeeds.
+        let (shared, handle) = hub(4, Speed::High);
+        power(&shared, 1);
+        handle.connect(1, Speed::Full, None);
+        shared.set_port_feature(1, port_feature::RESET).unwrap();
+        shared.clear_port_feature(1, port_feature::C_RESET).unwrap();
+
+        shared.set_port_feature(1, port_feature::SUSPEND).unwrap();
+
+        let (status, changes) = status(&shared, 1);
+        assert_eq!(status & port_status::SUSPEND, 0);
+        assert_eq!(status & port_status::ENABLE, port_status::ENABLE);
+        assert_eq!(changes & port_change::SUSPEND, 0);
     }
 
     #[test]
