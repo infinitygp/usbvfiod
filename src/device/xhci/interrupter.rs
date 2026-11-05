@@ -7,11 +7,12 @@ use tracing::{debug, info, warn};
 
 use crate::device::bus::BusDeviceRef;
 use crate::device::interrupt_line::{DummyInterruptLine, InterruptLine};
+use crate::device::pci::constants::xhci::operational::usbsts;
 use crate::device::pci::constants::xhci::runtime::IMOD_DEFAULT;
 use crate::device::xhci::controller_reset::ResetSender;
 use crate::device::xhci::event_ring::{EnqueueOutcome, EventRing};
 use crate::device::xhci::registers::{
-    ErdpRegister, ErstbaRegister, ErstszRegister, GenericRwRegister,
+    ErdpRegister, ErstbaRegister, ErstszRegister, GenericRwRegister, ImanRegister, UsbstsEvents,
 };
 use crate::device::xhci::trb::EventTrb;
 use crate::oneshot_anyhow::SendWithAnyhowError;
@@ -20,6 +21,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Interrupter {
     pub registers: InterrupterRegisters,
+    /// The event bits of USBSTS that the worker sets.
+    usbsts_events: UsbstsEvents,
     /// Transmits events to send to the worker
     msg_sender: mpsc::UnboundedSender<InterrupterMessage>,
 }
@@ -41,7 +44,7 @@ impl ResetSender for InterrupterResetSender {
 #[derive(Debug, Clone)]
 pub struct InterrupterRegisters {
     /// IMAN: Interrupt management register
-    pub interrupt_management: GenericRwRegister,
+    pub interrupt_management: ImanRegister,
     /// IMOD: Interrupt moderation interval
     ///
     /// The minimum interval in 250ns increments between interrupts.
@@ -69,6 +72,7 @@ impl Default for InterrupterRegisters {
 #[derive(Debug)]
 struct EventWorker {
     registers: InterrupterRegisters,
+    usbsts_events: UsbstsEvents,
     msg_recv: mpsc::UnboundedReceiver<InterrupterMessage>,
     interrupt_line: Arc<dyn InterruptLine>,
     event_ring: EventRing,
@@ -108,14 +112,17 @@ impl Interrupter {
         let (msg_sender, msg_recv) = mpsc::unbounded_channel();
         let registers = InterrupterRegisters::default();
 
+        let usbsts_events = UsbstsEvents::default();
         let interrupter = Self {
             registers: registers.clone(),
+            usbsts_events: usbsts_events.clone(),
             msg_sender,
         };
 
         let event_ring = EventRing::new(dma_bus);
         let worker = EventWorker {
             registers,
+            usbsts_events,
             msg_recv,
             interrupt_line: Arc::new(DummyInterruptLine::default()),
             event_ring,
@@ -132,6 +139,10 @@ impl Interrupter {
         self.msg_sender.send(msg)?;
 
         Ok(())
+    }
+
+    pub fn usbsts_events(&self) -> UsbstsEvents {
+        self.usbsts_events.clone()
     }
 
     pub fn create_event_sender(&self) -> EventSender {
@@ -189,7 +200,10 @@ impl EventWorker {
                 // we cannot use self.next_msg() here because it borrows self mutable, clashing
                 // with the borrow of self.registers above
                 msg = self.msg_recv.recv() => match msg.ok_or_else(|| anyhow!("event channel closed"))? {
-                    InterrupterMessage::SendEvent(_) => {}
+                    InterrupterMessage::SendEvent(event) => {
+                        // The driver still finds out about the change in the port register.
+                        self.note_port_change(&event);
+                    }
                     InterrupterMessage::UpdateInterruptLine(interrupt_line) => self.interrupt_line = interrupt_line,
                     InterrupterMessage::Reset(completion) => {
                         self.reset();
@@ -231,6 +245,21 @@ impl EventWorker {
         Ok(())
     }
 
+    /// Tell the driver that there is a new event on the ring.
+    fn signal_event(&self) {
+        self.registers.interrupt_management.set_pending();
+        self.usbsts_events.set(usbsts::EINT);
+        if self.registers.interrupt_management.interrupt_enabled() {
+            self.interrupt_line.interrupt();
+        }
+    }
+
+    fn note_port_change(&self, event: &EventTrb) {
+        if matches!(event, EventTrb::PortStatusChange(_)) {
+            self.usbsts_events.set(usbsts::PCD);
+        }
+    }
+
     /// Put as many pending events as possible onto the event ring.
     fn flush_pending_events(&mut self) {
         while let Some(event_trb) = self.pending_events.front() {
@@ -243,14 +272,15 @@ impl EventWorker {
 
             match outcome {
                 EnqueueOutcome::Enqueued => {
-                    self.interrupt_line.interrupt();
+                    self.signal_event();
                     if let Some(event_trb) = self.pending_events.pop_front() {
+                        self.note_port_change(&event_trb);
                         debug!("Sent event: {event_trb:?}");
                     }
                 }
                 EnqueueOutcome::FullErrorPosted => {
                     // The driver learns about the full ring from the error event.
-                    self.interrupt_line.interrupt();
+                    self.signal_event();
                     warn!(
                         "The event ring is full, {} events wait for the driver",
                         self.pending_events.len()
@@ -263,7 +293,8 @@ impl EventWorker {
     }
 
     fn reset(&mut self) {
-        self.registers.interrupt_management.write(0);
+        self.registers.interrupt_management.reset();
+        self.usbsts_events.reset();
         self.registers
             .interrupt_moderation_interval
             .write(IMOD_DEFAULT);

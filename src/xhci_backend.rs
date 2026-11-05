@@ -58,13 +58,10 @@ impl InterruptLine for InterruptEventFd {
         std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
         // Write any 8 byte value to the EventFd.
-        // TODO: we just expect this to always work currently.
-        let _amount = self
-            .fd
-            .lock()
-            .unwrap()
-            .write(&1u64.to_le_bytes())
-            .expect("should always be able to write event fd");
+        let result = self.fd.lock().unwrap().write(&1u64.to_le_bytes());
+        if let Err(err) = result {
+            warn!("failed to signal an interrupt: {err}");
+        }
     }
 }
 

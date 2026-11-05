@@ -52,8 +52,8 @@ pub struct XhciController<CRD: CompleteRealDevice> {
 impl<CRD: CompleteRealDevice> XhciController<CRD> {
     pub fn new(dma_bus: BusDeviceRef, async_runtime: runtime::Handle) -> Self {
         let usbcmd = UsbcmdRegister::new();
-        let usbsts = UsbstsRegister::new(usbcmd.value_reference());
         let interrupter = Interrupter::new(dma_bus.clone(), &async_runtime);
+        let usbsts = UsbstsRegister::new(usbcmd.value_reference(), interrupter.usbsts_events());
         let port_array = PortArray::new(interrupter.create_event_sender(), async_runtime.clone());
         let ep_launch_requester = EndpointLauncher::start(
             port_array.create_device_retriever(),
@@ -132,6 +132,16 @@ impl<CRD: CompleteRealDevice> XhciController<CRD> {
     }
 }
 
+/// Report that a worker of the controller stopped.
+///
+/// The guest must not be able to take the whole process down with it, and a stopped worker only
+/// affects the part of the controller that it implements.
+fn log_dead_worker(result: anyhow::Result<()>) {
+    if let Err(err) = result {
+        error!("a worker of the controller is gone: {err}");
+    }
+}
+
 /// We do not support 64-bit addressing, so the upper half of an address register is zero.
 fn ignore_upper_address_half(register: &str, value: u64) {
     if value != 0 {
@@ -164,16 +174,12 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
                     debug!("ignoring write of {value:#x} to DNCTL, device notifications are not supported");
                 }
             }
-            offset::CRCR => self
-                .command_ring
-                .control(value)
-                .expect("command worker should be alive"),
+            offset::CRCR => log_dead_worker(self.command_ring.control(value)),
             offset::CRCR_HI => ignore_upper_address_half("CRCR", value),
             offset::DCBAAP => self.slot_manager.dcbaap.write(value),
             offset::DCBAAP_HI => ignore_upper_address_half("DCBAAP", value),
             offset::CONFIG => self.slot_manager.config_reg.write(value as u32), // guard.enable_slots(value),
-            // USBSTS writes occur but we can ignore them (to get a device enumerated)
-            offset::USBSTS => {}
+            offset::USBSTS => self.usbsts.write(value),
             // xHC Runtime Registers (moved up for performance)
             offset::IMAN => self.interrupter.registers.interrupt_management.write(value),
             offset::IMOD => self
@@ -192,22 +198,15 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
                 .eventring_dequeue_pointer
                 .write(value),
             offset::ERDP_HI => ignore_upper_address_half("ERDP", value),
-            offset::DOORBELL_CONTROLLER => self
-                .command_ring
-                .doorbell()
-                .expect("command worker should be alive"),
+            offset::DOORBELL_CONTROLLER => log_dead_worker(self.command_ring.doorbell()),
             offset::DOORBELL_DEVICE..offset::DOORBELL_DEVICE_END => {
                 let slot_id = ((req.addr - offset::DOORBELL_CONTROLLER) / 4) as u8;
-                self.slot_manager
-                    .doorbell(slot_id, value as u8)
-                    .expect("slot worker should be alive");
+                log_dead_worker(self.slot_manager.doorbell(slot_id, value as u8));
             }
             addr if get_portsc_id(addr).is_some() => {
                 // SAFETY: unwrap() is safe because we already checked is_some() in the match guard above
                 let port_id = get_portsc_id(addr).unwrap();
-                self.port_array
-                    .write_portsc(port_id, value)
-                    .expect("event_sender should be alive");
+                log_dead_worker(self.port_array.write_portsc(port_id, value));
             }
 
             addr if get_portpmsc_id(addr).is_some() => {
@@ -301,5 +300,255 @@ impl<CRD: CompleteRealDevice> PciDevice for XhciController<CRD> {
                 0
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use tokio::time::sleep;
+    use usbvfiod::hotplug_protocol::response::Response;
+
+    use crate::{
+        device::{
+            bus::{testutils::TestBusDevice, Request, RequestSize},
+            pci::constants::xhci::{
+                operational::{crcr, portsc, usbsts},
+                rings::trb_types,
+            },
+            xhci::{
+                real_device::{tests::testutils::MockRealDevice, CompleteRealDeviceImpl},
+                trb::testutils::RawTrbBuilder,
+            },
+        },
+        dynamic_bus::DynamicBus,
+    };
+
+    use super::*;
+
+    type TestController = XhciController<CompleteRealDeviceImpl<MockRealDevice, (u8, u8)>>;
+
+    const DCBAA: u64 = 0x1000;
+    const COMMAND_RING: u64 = 0x2000;
+    const SEGMENT_TABLE: u64 = 0x3000;
+    const EVENT_RING: u64 = 0x4000;
+    const EVENT_RING_TRBS: u32 = 16;
+
+    #[derive(Debug, Default)]
+    struct CountingInterruptLine {
+        count: AtomicUsize,
+    }
+
+    impl InterruptLine for CountingInterruptLine {
+        fn interrupt(&self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Plays the part of the driver in front of the controller.
+    struct Driver {
+        controller: TestController,
+        ram: Arc<TestBusDevice>,
+        interrupts: Arc<CountingInterruptLine>,
+        command_cycle: bool,
+        next_command: u64,
+        next_event: u64,
+        event_cycle: bool,
+    }
+
+    impl Driver {
+        async fn new() -> Self {
+            let ram = Arc::new(TestBusDevice::new(&[0u8; 0x8000]));
+            let dma_bus = Arc::new(DynamicBus::new());
+            dma_bus.add(0, ram.clone()).unwrap();
+
+            let controller = TestController::new(dma_bus, runtime::Handle::current());
+            let interrupts = Arc::new(CountingInterruptLine::default());
+            controller.connect_irq(interrupts.clone());
+            // Let the workers start, so that they wait for the registers to be written.
+            sleep(Duration::from_millis(50)).await;
+
+            let driver = Self {
+                controller,
+                ram,
+                interrupts,
+                command_cycle: true,
+                next_command: COMMAND_RING,
+                next_event: EVENT_RING,
+                event_cycle: true,
+            };
+            driver.start().await;
+            driver
+        }
+
+        fn write32(&self, addr: u64, value: u32) {
+            self.controller
+                .write_io(0, Request::new(addr, RequestSize::Size4), value.into());
+        }
+
+        fn read32(&self, addr: u64) -> u32 {
+            self.controller
+                .read_io(0, Request::new(addr, RequestSize::Size4)) as u32
+        }
+
+        /// The initialization sequence of a driver.
+        async fn start(&self) {
+            self.write32(offset::USBCMD, usbcmd::HCRST as u32);
+            while self.read32(offset::USBCMD) & usbcmd::HCRST as u32 != 0 {
+                sleep(Duration::from_millis(1)).await;
+            }
+
+            self.write32(offset::CONFIG, 1);
+            self.write32(offset::DCBAAP, DCBAA as u32);
+            self.write32(offset::CRCR, COMMAND_RING as u32 | crcr::RCS as u32);
+
+            self.ram
+                .write_bulk(SEGMENT_TABLE, &EVENT_RING.to_le_bytes());
+            self.ram
+                .write_bulk(SEGMENT_TABLE + 8, &EVENT_RING_TRBS.to_le_bytes());
+            self.write32(offset::ERSTSZ, 1);
+            self.write32(offset::ERDP, EVENT_RING as u32);
+            self.write32(offset::ERSTBA, SEGMENT_TABLE as u32);
+            // The worker sets up the event ring after the write.
+            sleep(Duration::from_millis(50)).await;
+
+            self.write32(offset::IMAN, 0x2);
+            self.write32(offset::USBCMD, (usbcmd::RS | usbcmd::INTE) as u32);
+        }
+
+        fn ring_command(&mut self, trb_type: u8) -> u64 {
+            let address = self.next_command;
+            let mut command = RawTrbBuilder::new(address).with_trb_type(trb_type);
+            if self.command_cycle {
+                command = command.with_cycle();
+            }
+            let command = command.build();
+            self.ram.write_bulk(address, &command.buffer);
+            self.next_command += 16;
+
+            self.write32(offset::DOORBELL_CONTROLLER, 0);
+            address
+        }
+
+        /// Wait for the next event and consume it like a driver does.
+        async fn next_event(&mut self) -> [u8; 16] {
+            for _ in 0..200 {
+                let mut trb = [0u8; 16];
+                self.ram.read_bulk(self.next_event, &mut trb);
+                if (trb[12] & 1 != 0) == self.event_cycle {
+                    self.next_event += 16;
+                    // Tell the controller that we are done with the event.
+                    self.write32(offset::ERDP, self.next_event as u32 | 0x8);
+                    return trb;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+            panic!("no event arrived");
+        }
+
+        fn interrupt_count(&self) -> usize {
+            self.interrupts.count.load(Ordering::SeqCst)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn command_completion_raises_the_interrupt_and_the_status_bits() {
+        let mut driver = Driver::new().await;
+        assert_eq!(driver.read32(offset::USBSTS) & (usbsts::HCH as u32), 0);
+        assert_eq!(driver.read32(offset::USBSTS) & (usbsts::EINT as u32), 0);
+        assert_eq!(driver.read32(offset::IMAN), 0x2);
+
+        let command = driver.ring_command(trb_types::NO_OP_COMMAND);
+
+        let event = driver.next_event().await;
+        assert_eq!(event[13] >> 2, trb_types::COMMAND_COMPLETION_EVENT);
+        assert_eq!(event[0..8], command.to_le_bytes());
+        assert_eq!(event[11], 1, "completion code is success");
+
+        assert_eq!(driver.interrupt_count(), 1);
+        assert_eq!(driver.read32(offset::IMAN), 0x3, "interrupt pending");
+        assert_eq!(
+            driver.read32(offset::USBSTS) & (usbsts::EINT | usbsts::PCD) as u32,
+            usbsts::EINT as u32
+        );
+
+        // The driver acknowledges the interrupt.
+        driver.write32(offset::USBSTS, usbsts::EINT as u32);
+        driver.write32(offset::IMAN, 0x3);
+        assert_eq!(driver.read32(offset::IMAN), 0x2);
+        assert_eq!(driver.read32(offset::USBSTS) & usbsts::EINT as u32, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_interrupt_while_the_driver_disabled_it() {
+        let mut driver = Driver::new().await;
+        driver.write32(offset::IMAN, 0x0);
+
+        driver.ring_command(trb_types::NO_OP_COMMAND);
+        let event = driver.next_event().await;
+
+        assert_eq!(event[13] >> 2, trb_types::COMMAND_COMPLETION_EVENT);
+        assert_eq!(driver.interrupt_count(), 0);
+        assert_eq!(
+            driver.read32(offset::IMAN),
+            0x1,
+            "the event is still pending"
+        );
+        assert_eq!(
+            driver.read32(offset::USBSTS) & usbsts::EINT as u32,
+            usbsts::EINT as u32
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attaching_a_device_reports_a_port_change() {
+        let mut driver = Driver::new().await;
+        assert_eq!(driver.read32(offset::USBSTS) & usbsts::PCD as u32, 0);
+
+        let device = CompleteRealDeviceImpl::new((1, 1), MockRealDevice::default());
+        let response = driver.controller.hotplug_control().attach(device).await;
+        assert_eq!(response, Response::SuccessfulOperation);
+
+        let event = driver.next_event().await;
+        assert_eq!(event[13] >> 2, trb_types::PORT_STATUS_CHANGE_EVENT);
+        assert_eq!(
+            event[3], 1,
+            "the super speed device is on the first USB 3 port"
+        );
+        assert_eq!(
+            driver.read32(offset::USBSTS) & usbsts::PCD as u32,
+            usbsts::PCD as u32
+        );
+        assert_eq!(driver.interrupt_count(), 1);
+
+        let portsc = driver.read32(offset::PORTSC);
+        assert_eq!(portsc & portsc::CCS as u32, portsc::CCS as u32);
+        assert_eq!(portsc & portsc::CSC as u32, portsc::CSC as u32);
+
+        // Writing 1 clears the change bit.
+        driver.write32(offset::PORTSC, portsc::CSC as u32);
+        assert_eq!(driver.read32(offset::PORTSC) & portsc::CSC as u32, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn port_change_before_the_event_ring_exists_is_still_reported_in_usbsts() {
+        let ram = Arc::new(TestBusDevice::new(&[0u8; 0x1000]));
+        let dma_bus = Arc::new(DynamicBus::new());
+        dma_bus.add(0, ram).unwrap();
+        let controller = TestController::new(dma_bus, runtime::Handle::current());
+        sleep(Duration::from_millis(50)).await;
+
+        let device = CompleteRealDeviceImpl::new((1, 1), MockRealDevice::default());
+        controller.hotplug_control().attach(device).await;
+        sleep(Duration::from_millis(50)).await;
+
+        let usbsts = controller.read_io(0, Request::new(offset::USBSTS, RequestSize::Size4));
+        assert_eq!(usbsts & (usbsts::PCD | usbsts::EINT), usbsts::PCD);
+        let portsc = controller.read_io(0, Request::new(offset::PORTSC, RequestSize::Size4));
+        assert_eq!(portsc & portsc::CCS, portsc::CCS);
     }
 }

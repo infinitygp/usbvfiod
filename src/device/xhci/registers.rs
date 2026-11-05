@@ -155,7 +155,12 @@ impl ConfigureRegister {
 
     pub fn write(&self, value: u32) {
         let slots_enabled = (value & 0xff) as u8;
-        assert!(slots_enabled <= MAX_SLOTS as u8);
+        let value = if u64::from(slots_enabled) > MAX_SLOTS {
+            warn!("driver enables {slots_enabled} slots, but there are only {MAX_SLOTS}");
+            (value & !0xff) | MAX_SLOTS as u32
+        } else {
+            value
+        };
         self.value.store(value, Ordering::Relaxed);
     }
 
@@ -246,20 +251,99 @@ impl UsbcmdRegister {
     }
 }
 
+/// The status bits of USBSTS that the xHC sets for events and the driver clears (RW1C).
+#[derive(Debug, Default, Clone)]
+pub struct UsbstsEvents {
+    value: Arc<AtomicU32>,
+}
+
+impl UsbstsEvents {
+    const MASK: u64 = usbsts::EINT | usbsts::PCD;
+
+    /// Set status bits. Bits that are no event bits are ignored.
+    pub fn set(&self, bits: u64) {
+        self.value
+            .fetch_or((bits & Self::MASK) as u32, Ordering::Relaxed);
+    }
+
+    fn clear(&self, bits: u64) {
+        self.value
+            .fetch_and(!((bits & Self::MASK) as u32), Ordering::Relaxed);
+    }
+
+    fn read(&self) -> u64 {
+        self.value.load(Ordering::Relaxed).into()
+    }
+
+    pub fn reset(&self) {
+        self.value.store(0, Ordering::Relaxed);
+    }
+}
+
+/// USB Status Register (chapter 5.4.2)
 #[derive(Debug)]
 pub struct UsbstsRegister {
     usbcmd: Arc<AtomicU32>,
+    events: UsbstsEvents,
 }
 
 impl UsbstsRegister {
-    pub const fn new(usbcmd: Arc<AtomicU32>) -> Self {
-        Self { usbcmd }
+    pub const fn new(usbcmd: Arc<AtomicU32>, events: UsbstsEvents) -> Self {
+        Self { usbcmd, events }
     }
 
     pub fn read(&self) -> u64 {
         let is_running = (self.usbcmd.load(Ordering::Relaxed) as u64 & usbcmd::RS) == usbcmd::RS;
         let hch = if is_running { 0 } else { usbsts::HCH };
-        hch | usbsts::EINT | usbsts::PCD
+        hch | self.events.read()
+    }
+
+    /// Writing a 1 clears the event bits (RW1C). All other bits are read-only here.
+    pub fn write(&self, value: u64) {
+        self.events.clear(value);
+    }
+}
+
+/// Interrupter Management Register (chapter 5.5.2.1)
+///
+/// IP is set by the xHC when it puts an event on the Event Ring and cleared by software with
+/// a write of 1. IE is a plain read/write bit.
+#[derive(Debug, Default, Clone)]
+pub struct ImanRegister {
+    value: Arc<AtomicU32>,
+}
+
+impl ImanRegister {
+    const IP: u32 = 0x1;
+    const IE: u32 = 0x2;
+
+    pub fn read(&self) -> u64 {
+        self.value.load(Ordering::Relaxed).into()
+    }
+
+    pub fn write(&self, new_value: u64) {
+        let new_value = new_value as u32;
+        let _ = self
+            .value
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                let mut value = (current & !Self::IE) | (new_value & Self::IE);
+                if new_value & Self::IP != 0 {
+                    value &= !Self::IP;
+                }
+                Some(value)
+            });
+    }
+
+    pub fn set_pending(&self) {
+        self.value.fetch_or(Self::IP, Ordering::Relaxed);
+    }
+
+    pub fn interrupt_enabled(&self) -> bool {
+        self.value.load(Ordering::Relaxed) & Self::IE != 0
+    }
+
+    pub fn reset(&self) {
+        self.value.store(0, Ordering::Relaxed);
     }
 }
 
@@ -455,7 +539,7 @@ mod tests {
     #[test]
     fn usbsts_read_is_consistent_with_usbcmd_status() {
         let usbcmd = UsbcmdRegister::new();
-        let usbsts = UsbstsRegister::new(usbcmd.value_reference());
+        let usbsts = UsbstsRegister::new(usbcmd.value_reference(), UsbstsEvents::default());
 
         assert_eq!(
             usbsts.read() & usbsts::HCH,
@@ -471,12 +555,78 @@ mod tests {
             "HCHalted bit is a 0 whenever the Run/Stop (R/S) bit is a 1."
         );
 
-        let static_bits = usbsts::EINT | usbsts::PCD;
         assert_eq!(
-            usbsts.read() & static_bits,
-            static_bits,
-            "After creating this register we have some initial values."
+            usbsts.read() & (usbsts::EINT | usbsts::PCD),
+            0,
+            "After creating this register no event happened."
         );
+    }
+
+    #[test]
+    fn usbsts_event_bits_are_set_by_the_xhc_and_cleared_by_writing_one() {
+        let events = UsbstsEvents::default();
+        let usbsts = UsbstsRegister::new(UsbcmdRegister::new().value_reference(), events.clone());
+
+        events.set(usbsts::EINT | usbsts::PCD);
+        assert_eq!(usbsts.read() & 0x18, 0x18);
+
+        usbsts.write(0);
+        assert_eq!(usbsts.read() & 0x18, 0x18, "zeros do not clear");
+
+        usbsts.write(usbsts::EINT);
+        assert_eq!(usbsts.read() & 0x18, usbsts::PCD);
+
+        usbsts.write(!0);
+        assert_eq!(usbsts.read() & 0x18, 0);
+        assert_eq!(
+            usbsts.read() & usbsts::HCH,
+            usbsts::HCH,
+            "the halted bit is not writable"
+        );
+
+        events.set(!usbsts::PCD);
+        assert_eq!(
+            usbsts.read() & 0x18,
+            usbsts::EINT,
+            "only event bits can be set"
+        );
+    }
+
+    #[test]
+    fn iman_pending_bit_is_cleared_by_writing_one_and_enable_bit_is_plain() {
+        let iman = ImanRegister::default();
+        assert!(!iman.interrupt_enabled());
+
+        iman.write(0x2);
+        assert!(iman.interrupt_enabled());
+        assert_eq!(iman.read(), 0x2);
+
+        iman.set_pending();
+        assert_eq!(iman.read(), 0x3);
+
+        // Writing the enable bit alone leaves the pending bit alone.
+        iman.write(0x2);
+        assert_eq!(iman.read(), 0x3);
+
+        // Writing 1 to IP clears it and 0 to IE disables.
+        iman.write(0x1);
+        assert_eq!(iman.read(), 0x0);
+        assert!(!iman.interrupt_enabled());
+
+        iman.set_pending();
+        iman.reset();
+        assert_eq!(iman.read(), 0x0);
+    }
+
+    #[test]
+    fn configure_register_limits_the_enabled_slots() {
+        let config = ConfigureRegister::default();
+
+        config.write(MAX_SLOTS as u32);
+        assert_eq!(config.num_slots_enabled(), MAX_SLOTS as u8);
+
+        config.write(0xff);
+        assert_eq!(config.num_slots_enabled(), MAX_SLOTS as u8);
     }
 
     #[test]
