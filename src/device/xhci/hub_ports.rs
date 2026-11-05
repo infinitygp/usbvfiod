@@ -230,6 +230,12 @@ impl HubShared {
 
     fn set_suspended(&self, suspended: bool) {
         self.with_state(|state| state.suspended = suspended);
+        // A change that the driver did not collect yet wakes a hub that goes to sleep with its
+        // wakeup armed: a device came after the driver stopped looking at the status change
+        // endpoint and before it suspended the port. Nothing would wake the hub later.
+        if suspended && self.status_change_bitmap().is_some() {
+            self.wake_upstream();
+        }
     }
 
     fn set_upstream(&self, upstream: Option<Upstream>) {
@@ -1034,6 +1040,78 @@ mod tests {
         // The hub is awake after it signalled.
         handle.disconnect(2);
         assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_change_that_is_pending_when_the_root_port_suspends_wakes_the_hub_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (hub, handle) = hub(4, Speed::High);
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let counter = wakeups.clone();
+        handle.connect_to_root_port(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        power(&hub, 1);
+        hub.set_remote_wakeup(true);
+
+        // The device came while the hub was awake, and the driver did not collect the change
+        // yet, because the controller suspends the root port first.
+        handle.connect(1, Speed::Full, None);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 0);
+        handle.set_suspended(true);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+
+        // The hub is awake after it signalled, and a hub without a change goes to sleep.
+        hub.clear_port_feature(1, port_feature::C_CONNECTION)
+            .unwrap();
+        handle.set_suspended(true);
+        assert_eq!(wakeups.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_change_that_is_pending_when_the_hub_suspends_needs_the_wakeup_to_be_armed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (hub, handle) = hub(4, Speed::High);
+        let wakeups = Arc::new(AtomicUsize::new(0));
+        let counter = wakeups.clone();
+        handle.connect_to_root_port(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        power(&hub, 1);
+        handle.connect(1, Speed::Full, None);
+
+        handle.set_suspended(true);
+
+        assert_eq!(wakeups.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_change_that_is_pending_when_the_driver_suspends_the_port_wakes_the_hub_at_once() {
+        let (outer, outer_handle) = hub(4, Speed::High);
+        let (inner, inner_handle) = hub(4, Speed::High);
+        power(&outer, 1);
+        outer_handle.connect(1, Speed::High, Some(inner_handle.clone()));
+        outer.set_port_feature(1, port_feature::RESET).unwrap();
+        for change in [port_feature::C_CONNECTION, port_feature::C_RESET] {
+            outer.clear_port_feature(1, change).unwrap();
+        }
+        power(&inner, 2);
+        inner.set_remote_wakeup(true);
+
+        // A device arrives after the driver stopped the status change endpoint of the hub, and
+        // before it suspends the port.
+        inner_handle.connect(2, Speed::Full, None);
+        assert_eq!(outer.status_change_bitmap(), None);
+        outer.set_port_feature(1, port_feature::SUSPEND).unwrap();
+
+        // The port resumed at once, and the driver learns about it.
+        let (status, changes) = status(&outer, 1);
+        assert_eq!(status & port_status::SUSPEND, 0);
+        assert_eq!(changes, port_change::SUSPEND);
+        assert_eq!(outer.status_change_bitmap(), Some(vec![1 << 1]));
+        assert_eq!(inner.status_change_bitmap(), Some(vec![1 << 2]));
     }
 
     #[tokio::test]
