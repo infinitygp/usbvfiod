@@ -109,6 +109,10 @@ impl DynamicBus {
     /// the part that is outside. Returns the number of devices that were
     /// affected.
     pub fn remove_range(&self, start_addr: u64, size: u64) -> usize {
+        if size == 0 {
+            return 0;
+        }
+
         let end_addr = start_addr.saturating_add(size);
         let mut segments = self.segments.lock().unwrap();
 
@@ -280,6 +284,15 @@ mod tests {
         assert_eq!(bus.remove_range(0x20000, 0x1000), 0);
         assert_eq!(bus.remove_range(0x0, 0x10000), 0);
         assert_eq!(byte_at(&bus, 0x10000), 1);
+    }
+
+    #[test]
+    fn remove_empty_range_changes_nothing() {
+        let bus = bus_with_pattern();
+
+        assert_eq!(bus.remove_range(0x11000, 0), 0);
+        assert_eq!(byte_at(&bus, 0x10fff), 1);
+        assert_eq!(byte_at(&bus, 0x11000), 2);
     }
 
     #[test]
