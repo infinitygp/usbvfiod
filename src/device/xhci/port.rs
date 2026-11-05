@@ -13,6 +13,7 @@ use crate::{
     device::{
         pci::constants::xhci::{offset, operational::portsc, MAX_PORTS, NUM_USB3_PORTS},
         xhci::{
+            controller_reset::ResetSender,
             interrupter::EventSender,
             real_device::{CompleteRealDevice, RealDevice, Speed},
             registers::{PortpmscRegister, PortscRegister},
@@ -49,6 +50,7 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
         let worker = PortWorker {
             devices: [const { None }; MAX_PORTS as usize].into(),
             portsc: portsc.clone(),
+            portpmsc: portpmsc.clone(),
             event_sender,
             msg_sender: msg_sender.clone(),
             msg_recv,
@@ -92,6 +94,12 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
         }
     }
 
+    pub fn reset_sender(&self) -> PortArrayResetSender<CRD> {
+        PortArrayResetSender {
+            msg_send: self.msg_sender.clone(),
+        }
+    }
+
     fn port_version(port_id: u8) -> UsbVersion {
         match port_id as u64 {
             1..=NUM_USB3_PORTS => UsbVersion::USB3,
@@ -102,9 +110,23 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
 }
 
 #[derive(Debug)]
+pub struct PortArrayResetSender<CRD: CompleteRealDevice> {
+    msg_send: mpsc::UnboundedSender<PortMessage<CRD>>,
+}
+
+impl<CRD: CompleteRealDevice> ResetSender for PortArrayResetSender<CRD> {
+    fn send_reset(&self, completion_notifier: oneshot::Sender<()>) -> anyhow::Result<()> {
+        self.msg_send
+            .send(PortMessage::ResetPorts(completion_notifier))
+            .map_err(|_| anyhow!("port channel closed"))
+    }
+}
+
+#[derive(Debug)]
 struct PortWorker<CRD: CompleteRealDevice> {
     devices: OneIndexed<Option<AttachedDevice<CRD>>, { MAX_PORTS as usize }>,
     portsc: Arc<OneIndexed<PortscRegister, { MAX_PORTS as usize }>>,
+    portpmsc: Arc<OneIndexed<PortpmscRegister, { MAX_PORTS as usize }>>,
     event_sender: EventSender,
     // the worker does not use the sender itself but needs to pass clones of the sender to detach listeners
     msg_sender: mpsc::UnboundedSender<PortMessage<CRD>>,
@@ -132,6 +154,8 @@ pub enum PortMessage<CRD: CompleteRealDevice> {
     ListAttached(oneshot::Sender<Vec<CRD::ID>>),
     // port id
     GetDevice(usize, oneshot::Sender<Option<Arc<CRD>>>),
+    // Host Controller Reset
+    ResetPorts(oneshot::Sender<()>),
 }
 
 impl<CRD: CompleteRealDevice> PortWorker<CRD> {
@@ -161,6 +185,10 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
                         .get(port_id)
                         .and_then(|opt| opt.as_ref().map(|attached| attached.device.clone()));
                     responder.send_anyhow(device)?;
+                }
+                PortMessage::ResetPorts(completion) => {
+                    self.reset_ports();
+                    completion.send_anyhow(())?;
                 }
             };
         }
@@ -211,25 +239,7 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             instance_id,
         });
 
-        let new_portsc = match version {
-            UsbVersion::USB3 => {
-                portsc::CCS
-                    | portsc::PED
-                    | portsc::PP
-                    | portsc::CSC
-                    | portsc::PEC
-                    | portsc::PRC
-                    | (speed as u64) << 10
-            }
-            UsbVersion::USB2 => {
-                portsc::CCS
-                    | portsc::value::PLS_POLLING
-                    | portsc::PP
-                    | (speed as u64) << 10
-                    | portsc::CSC
-            }
-        };
-        self.portsc[available_port_id].set(new_portsc);
+        self.portsc[available_port_id].set(connected_portsc(version, speed));
 
         info!(
             "Attached {speed} device {identifier:?} to port {available_port_id} ({version:?} port)"
@@ -239,6 +249,24 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         self.event_sender.send(event)?;
 
         Ok(Response::SuccessfulOperation)
+    }
+
+    /// Bring the port registers into the state a Host Controller Reset leaves them in.
+    ///
+    /// A device that is still connected shows up as freshly connected, like on a real controller
+    /// that detects the device after the reset. No event is sent because the driver sets up the
+    /// event ring anew and looks at the ports on its own.
+    fn reset_ports(&self) {
+        for port_id in 1..=MAX_PORTS as usize {
+            let speed = self.devices[port_id]
+                .as_ref()
+                .and_then(|attached| attached.device.realdevice_ref().speed());
+            let value = speed.map_or(portsc::PP | portsc::value::PLS_RXDETECT, |speed| {
+                connected_portsc(self.portsc[port_id].usb_version(), speed)
+            });
+            self.portsc[port_id].set(value);
+            self.portpmsc[port_id].write(0);
+        }
     }
 
     fn attached_devices(&self) -> Vec<CRD::ID> {
@@ -318,6 +346,28 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         info!("Detached device {id:?} from port {port_id}");
 
         Ok(Response::SuccessfulOperation)
+    }
+}
+
+/// The PORTSC value of a port right after a device of the given speed connected.
+const fn connected_portsc(version: UsbVersion, speed: Speed) -> u64 {
+    match version {
+        UsbVersion::USB3 => {
+            portsc::CCS
+                | portsc::PED
+                | portsc::PP
+                | portsc::CSC
+                | portsc::PEC
+                | portsc::PRC
+                | (speed as u64) << 10
+        }
+        UsbVersion::USB2 => {
+            portsc::CCS
+                | portsc::value::PLS_POLLING
+                | portsc::PP
+                | (speed as u64) << 10
+                | portsc::CSC
+        }
     }
 }
 
@@ -509,5 +559,61 @@ mod tests {
 
         assert_eq!(response, vec![]);
         assert!(interrupter.is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_controller_reset_restores_the_ports_but_keeps_the_devices_connected() {
+        let async_runtime = Handle::current();
+        let (event_sender, mut interrupter) = MockInterrupter::new();
+        let port_array: PortArray<CompleteRealDeviceImpl<MockRealDevice, (u8, u8)>> =
+            PortArray::new(event_sender, async_runtime);
+        let hotplug_control = port_array.create_hotplug_control();
+
+        let response = hotplug_control
+            .attach(CompleteRealDeviceImpl::new(
+                IDENTIFIER,
+                MockRealDevice::default(),
+            ))
+            .await;
+        assert_eq!(response, Response::SuccessfulOperation);
+        assert!(interrupter.await_event().await.is_some());
+        let connected = port_array.read_portsc(PORT_ID as usize);
+        assert_eq!(connected & portsc::CCS, portsc::CCS);
+
+        // The driver enumerated the device and cleared the change bits, and then the guest restarts.
+        port_array
+            .write_portsc(PORT_ID as usize, portsc::CSC | portsc::PEC | portsc::PRC)
+            .unwrap();
+        assert_eq!(port_array.read_portsc(PORT_ID as usize) & portsc::CSC, 0);
+        port_array.write_portpmsc(PORT_ID as usize, 0x1234);
+        port_array.write_portsc(2, portsc::PR).unwrap();
+        assert!(interrupter.await_event().await.is_some());
+
+        timeout(
+            Duration::from_secs(ASYNC_TIMEOUT_SECS),
+            port_array.reset_sender().reset().unwrap(),
+        )
+        .await
+        .expect("local timeout on await")
+        .unwrap();
+
+        // The connected device is found as new.
+        assert_eq!(port_array.read_portsc(PORT_ID as usize), connected);
+        assert_eq!(port_array.read_portpmsc(PORT_ID as usize), 0);
+        // An empty port went back to its initial state.
+        assert_eq!(
+            port_array.read_portsc(2),
+            portsc::PP | portsc::value::PLS_RXDETECT
+        );
+        assert!(interrupter.is_empty());
+        assert_eq!(
+            timeout(
+                Duration::from_secs(ASYNC_TIMEOUT_SECS),
+                hotplug_control.list_devices()
+            )
+            .await
+            .expect("local timeout on await"),
+            vec![IDENTIFIER]
+        );
     }
 }

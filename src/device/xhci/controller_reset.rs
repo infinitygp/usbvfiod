@@ -24,13 +24,13 @@ pub trait ResetSender: Send + Sync {
 /// and clears `HCRST` after all reset completion signals were received.
 pub struct ResetCoordinator {
     usbcmd: UsbcmdRegister,
-    reset_senders: [Box<dyn ResetSender>; 3],
+    reset_senders: [Box<dyn ResetSender>; 4],
 }
 
 impl ResetCoordinator {
     pub fn start(
         usbcmd: UsbcmdRegister,
-        reset_senders: [Box<dyn ResetSender>; 3],
+        reset_senders: [Box<dyn ResetSender>; 4],
         async_runtime: &runtime::Handle,
     ) {
         let coordinator = Self {
@@ -99,13 +99,16 @@ mod tests {
                 Box::new(TestResetSender {
                     completion_sender: completion_sender.clone(),
                 }),
+                Box::new(TestResetSender {
+                    completion_sender: completion_sender.clone(),
+                }),
                 Box::new(TestResetSender { completion_sender }),
             ],
         };
 
         let reset_task = tokio::spawn(async move { coordinator.reset().await });
 
-        for _ in 0..3 {
+        for _ in 0..4 {
             let completion = completion_receiver.recv().await.unwrap();
             assert_eq!(usbcmd.read() & usbcmd::HCRST, usbcmd::HCRST);
             completion.send(()).unwrap();

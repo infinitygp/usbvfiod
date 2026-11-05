@@ -75,6 +75,7 @@ impl<CRD: CompleteRealDevice> XhciController<CRD> {
                 Box::new(command_ring.reset_sender()),
                 Box::new(interrupter.reset_sender()),
                 Box::new(slot_manager.reset_sender()),
+                Box::new(port_array.reset_sender()),
             ],
             &async_runtime,
         );
