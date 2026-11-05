@@ -101,5 +101,21 @@ before or after the controller is added to the guest, then compare `Get-PnpDevic
 `remote --tree` shows. Detach and attach devices and whole hubs at their paths to check that Windows
 follows (`Present` is False, then True again, with status OK).
 
+An external device (see [External Devices](../users/external-devices.md)) needs no hardware either.
+`examples/external_hid.rs` serves a full speed HID with USB 1.10 and 8 bytes for endpoint 0 on a
+unix socket; `remote --external` below the hubs of a tree attaches it:
+
+```console
+$ cargo run --example external_hid -- --listen $PWD/D &
+$ remote --socket H --external 5.1.1.4 --speed full --connect $PWD/D --name hid
+```
+
+Windows lists it as `USB\VID_1209&PID_DE01\0001` with the location path
+`...#USBROOT(0)#USB(5)#USB(1)#USB(1)#USB(4)`, `usbtree.ps1` shows `speed=full` and `bcdUSB=0110`,
+and the HID driver polls the interrupt endpoint from the start. Disabling the device in the guest
+(`Disable-PnpDevice`) makes the controller send a `CMD_UNLINK` for the waiting transfer. Stopping
+the server closes the connection, which detaches the device (`Present` is False), and a new server
+and a new `remote --external` bring it back.
+
 Only attach host devices that the host can spare: `remote` resets a device, and usbvfiod takes it
 from its kernel driver until it is detached.
