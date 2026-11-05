@@ -274,12 +274,9 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
             return;
         }
 
-        // The registers of the xHC are 32 bits wide, and 64-bit registers consist of two of them.
-        // Splitting an 8-byte access is what the specification allows for a controller without
-        // 64-bit addressing.
-        for (chunk_offset, start, len) in split_access(offset, data.len()) {
-            let chunk = &mut data[start..start + len];
-            let Ok(size) = RequestSize::try_from(len) else {
+        for (chunk_offset, start, chunk_len) in split_access(offset, data.len()) {
+            let chunk = &mut data[start..start + chunk_len];
+            let Ok(size) = RequestSize::try_from(chunk_len) else {
                 return;
             };
             let req = Request::new(chunk_offset, size);
@@ -305,9 +302,9 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
             return;
         }
 
-        for (chunk_offset, start, len) in split_access(offset, data.len()) {
-            let chunk = &data[start..start + len];
-            let Ok(size) = RequestSize::try_from(len) else {
+        for (chunk_offset, start, chunk_len) in split_access(offset, data.len()) {
+            let chunk = &data[start..start + chunk_len];
+            let Ok(size) = RequestSize::try_from(chunk_len) else {
                 return;
             };
             let req = Request::new(chunk_offset, size);
