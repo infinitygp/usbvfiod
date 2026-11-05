@@ -2,7 +2,8 @@
 # Releases the fork's usbvfiod from this machine: checks, a static musl binary in
 # usbvfiod-VERSION-x86_64-linux.tar.gz, a dry-run install into an empty HOME, then the tag VERSION and
 # a GitHub release with the package attached. There is no release workflow.
-# Usage: scripts/release.sh [--dry-run]   (--dry-run stops before the tag)
+# Usage: scripts/release.sh [--dry-run]   (--dry-run stops before the tag, and only notes a tag
+# that already exists for the version)
 set -euo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$repo"
@@ -22,8 +23,10 @@ case $version in *-fork.*) ;; *) fail "version $version is not a fork version (u
 [ -z "$(git status --porcelain)" ] || fail "the working tree has uncommitted changes"
 [ "$(git ls-remote "$remote" refs/heads/main | cut -f1)" = "$(git rev-parse HEAD)" ] \
     || fail "HEAD is not what main on GitHub points to; push main first"
-[ -z "$(git ls-remote "$remote" "refs/tags/$tag")" ] || fail "$tag already exists on GitHub"
-if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then fail "$tag already exists here"; fi
+# A dry run checks the package of any commit; only a release needs a version that has no tag yet.
+taken() { if $dry; then log "note: $1; a release needs a version bump first"; else fail "$1"; fi; }
+[ -z "$(git ls-remote "$remote" "refs/tags/$tag")" ] || taken "$tag already exists on GitHub"
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then taken "$tag already exists here"; fi
 [ ! -d .github/workflows ] || fail ".github/workflows is back (a merge from upstream?): the fork runs no workflow"
 
 log "checks"
@@ -55,12 +58,16 @@ tar -C "$try/unpacked" -xzf "$archive"
 in_home() { env -i HOME="$try/home" PATH="$try/home/.local/bin:/usr/bin:/bin" "$@"; }
 in_home bash "$try/unpacked/$name/install.sh" >/dev/null
 [ "$(in_home usbvfiod --version)" = "usbvfiod $version" ] || fail "installed usbvfiod has the wrong version"
-# The server opens its vfio-user and hotplug sockets and ends on SIGTERM.
-in_home usbvfiod --socket-path "$try/run/S" --hotplug-socket-path "$try/run/H" >"$try/run/log" 2>&1 &
+# The server opens its vfio-user and hotplug sockets and ends on SIGTERM. It is started with env
+# itself, not through a shell function, so that $! is the server's PID (env execs it).
+env -i HOME="$try/home" PATH="$try/home/.local/bin:/usr/bin:/bin" \
+    usbvfiod --socket-path "$try/run/S" --hotplug-socket-path "$try/run/H" >"$try/run/log" 2>&1 &
 server=$!
 for _ in $(seq 50); do [ -S "$try/run/S" ] && [ -S "$try/run/H" ] && break; sleep 0.2; done
 [ -S "$try/run/S" ] && [ -S "$try/run/H" ] || { kill "$server" 2>/dev/null; fail "the server opened no sockets: $(tail -3 "$try/run/log")"; }
 kill -TERM "$server"
+for _ in $(seq 25); do kill -0 "$server" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "$server" 2>/dev/null; then kill -KILL "$server"; fail "the server did not end on SIGTERM"; fi
 wait "$server" || true
 in_home bash "$try/unpacked/$name/install.sh" --uninstall >/dev/null
 [ ! -e "$try/home/.local/bin/usbvfiod" ] || fail "uninstall left the binary"
