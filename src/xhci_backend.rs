@@ -89,10 +89,11 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
     /// This is what remains to do after the connection to the client closed: Guest memory and
     /// interrupts are gone, and the controller must start from scratch for the next client.
     pub fn disconnect(&self) {
-        self.dma_bus.clear();
+        // Reset while the guest memory is still mapped, so that the workers can finish their work.
+        self.controller.reset();
         self.controller
             .connect_irq(Arc::new(DummyInterruptLine::default()));
-        self.controller.reset();
+        self.dma_bus.clear();
     }
 }
 
@@ -389,11 +390,8 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
             }
             None => {
                 // Guest memory like ROMs and device memory the VMM does not share with other
-                // processes. A driver cannot use it as DMA buffer, as long as it comes from RAM that
-                // is shared.
-                warn!(
-                    "DMA mapping at {address:#x}+{size:#x} comes without a file descriptor and is not accessible"
-                );
+                // processes. A driver does not use it as DMA buffer as long as the RAM is shared.
+                // The segment warns about the first access.
                 Arc::new(UnbackedSegment::new(address, size))
             }
         };
