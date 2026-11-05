@@ -10,6 +10,7 @@ Hypervisor virtual machine. For a basic overview of the goals, see the
 - [Basic Setup and Invocation](./users/basic.md)
 - [Using usbvfiod with QEMU](./users/qemu.md)
 - [Hubs and Port Paths](./users/hubs.md)
+- [External Devices](./users/external-devices.md)
 - [Systemd Setup](./users/systemd.md)
 - [Security Considerations](./users/security.md)
 

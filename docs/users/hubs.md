@@ -47,6 +47,10 @@ $ remote --socket H --detach-at 5
   below). A high speed hub has a single transaction translator.
 - `--virtual-hid PATH --speed full|high` attaches a test device that enumerates as a HID device
   with a vendor defined report and sends a report four times a second. It needs no hardware.
+- `--external PATH --speed low|full|high --connect SOCKET [--name NAME]` attaches an external
+  device, a device that another process emulates: `remote` connects to the unix socket `SOCKET` of
+  a device server and gives `usbvfiod` the connected socket, over which the server answers the
+  transfers of the guest. See [External Devices](./external-devices.md).
 - `--attach-at PATH --device /dev/bus/usb/BBB/DDD` attaches a device of the host at a path. Like
   `--attach`, it resets the device and hands the file descriptor to usbvfiod.
 - `--detach-at PATH` detaches the device at a path. `--tree` lists all devices with their paths,
@@ -63,9 +67,9 @@ high speed device below a full speed hub), `InvalidRequest` (a wrong hub descrip
 ## The protocol of the hotplug socket
 
 The three-byte commands `attach`, `detach` and `list` and their one-byte replies are unchanged.
-The new commands start with a command byte of the range 0x10 to 0x14, followed by the length of
+The new commands start with a command byte of the range 0x10 to 0x15, followed by the length of
 the payload as 32-bit little endian number and the payload as JSON. `attach-at` carries the file
-descriptor of the device like `attach`. The reply is a 32-bit little endian length and a JSON
+descriptor of the device like `attach`, and the command 0x15 carries one end of a socket. The reply is a 32-bit little endian length and a JSON
 object with the `response` (the name of a `Response`), an optional `message` and, for the tree
 command, the list `tree`. The code is in `src/hotplug_protocol`.
 
@@ -76,6 +80,7 @@ command, the list `tree`. The code is in `src/hotplug_protocol`.
 | 0x12 | attach the virtual HID | `{"path":"5.1","speed":"full"}` |
 | 0x13 | detach at a path | `{"path":"5"}` |
 | 0x14 | list the tree | `{}` |
+| 0x15 | attach an external device | `{"path":"5.1.1.4","speed":"full","name":"hid"}` and a file descriptor (see [External Devices](./external-devices.md)) |
 
 The `spec` of a hub has the fields `vid`, `pid`, `bcd_device`, `manufacturer`, `product`,
 `serial`, `ports`, `speed` and `descriptors` (see `HubSpec`).
