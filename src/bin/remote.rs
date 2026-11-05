@@ -13,7 +13,7 @@
 
 use std::{
     fs::File,
-    os::unix::net::UnixStream,
+    os::{fd::OwnedFd, unix::net::UnixStream},
     path::{Path, PathBuf},
 };
 
@@ -57,6 +57,15 @@ fn main() -> Result<()> {
             .context("--virtual-hid needs the speed with --speed full or --speed high")?;
         ask(socket, Command::AttachVirtualHid { path, speed })
             .and_then(|reply| report_attach(&reply, path))?;
+    } else if let Some(path) = args.external {
+        let speed = args
+            .speed
+            .context("--external needs the speed with --speed low, --speed full or --speed high")?;
+        let server = args
+            .connect
+            .as_deref()
+            .context("--external needs the socket of the device server with --connect")?;
+        attach_external(path, speed, args.name.clone(), server, socket)?;
     } else if let Some(path) = args.detach_at {
         println!("Requesting detach of the device at {path}");
         let reply = ask(socket, Command::DetachAt { path })?;
@@ -131,6 +140,29 @@ fn attach_at(path: PortPath, device_path: &Path, socket_path: &Path) -> Result<(
             bus,
             device,
             fd,
+        },
+    )?;
+    report_attach(&reply, path)
+}
+
+/// Connect to a device server and hand the connected socket to the controller, which serves the
+/// device on it. The server stays connected to the controller after this command exits.
+fn attach_external(
+    path: PortPath,
+    speed: UsbSpeed,
+    name: Option<String>,
+    server: &Path,
+    socket_path: &Path,
+) -> Result<()> {
+    let device = UnixStream::connect(server)
+        .with_context(|| format!("Failed to connect to the device server {server:?}"))?;
+    let reply = ask(
+        socket_path,
+        Command::AttachExternal {
+            path,
+            speed,
+            name,
+            fd: File::from(OwnedFd::from(device)),
         },
     )?;
     report_attach(&reply, path)
@@ -283,7 +315,7 @@ fn list_attached(socket_path: &Path) -> Result<()> {
     long_about = None,
     group(
         clap::ArgGroup::new("action")
-            .args(["attach", "detach", "list", "hub", "attach_at", "virtual_hid", "detach_at", "tree"])
+            .args(["attach", "detach", "list", "hub", "attach_at", "virtual_hid", "external", "detach_at", "tree"])
             .multiple(false)
     )
 )]
@@ -326,6 +358,13 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     virtual_hid: Option<PortPath>,
 
+    /// Attach an external device at a port path: connect to the unix socket of the device server
+    /// given with --connect, and let usbvfiod serve the device on that connection. The server
+    /// answers the transfers of the guest with USB/IP framing, see
+    /// docs/users/external-devices.md. Give the speed of the device with --speed.
+    #[arg(long, value_name = "PATH")]
+    external: Option<PortPath>,
+
     /// Detach the device at a port path, with the devices below it if it is a hub.
     #[arg(long, value_name = "PATH")]
     detach_at: Option<PortPath>,
@@ -338,9 +377,18 @@ struct Cli {
     #[arg(long, value_name = "PATH", requires = "attach_at")]
     device: Option<PathBuf>,
 
-    /// The speed of the hub of --hub, or of the device of --virtual-hid: full or high.
+    /// The speed of the hub of --hub, or of the device of --virtual-hid (full or high) or
+    /// --external (low, full or high).
     #[arg(long, value_name = "SPEED")]
     speed: Option<UsbSpeed>,
+
+    /// The socket of the device server for --external. It must be listening.
+    #[arg(long, value_name = "PATH", requires = "external")]
+    connect: Option<PathBuf>,
+
+    /// The name of the device of --external, for the log and for --tree.
+    #[arg(long, value_name = "TEXT", requires = "external")]
+    name: Option<String>,
 
     /// The number of downstream ports of the hub of --hub, 1 to 15.
     #[arg(long, value_name = "N", requires = "hub")]
