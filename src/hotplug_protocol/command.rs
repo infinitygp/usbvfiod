@@ -17,12 +17,13 @@ const COMMAND_LIST: u8 = 2;
 
 // The framed commands have an ID of their own range: the command, the length of the payload as
 // 32-bit little endian number and a JSON payload of that length. The attach command takes a file
-// descriptor as well.
+// descriptor as well, like the attach command of an external device.
 const COMMAND_ATTACH_AT: u8 = 0x10;
 const COMMAND_ATTACH_HUB: u8 = 0x11;
 const COMMAND_ATTACH_VIRTUAL_HID: u8 = 0x12;
 const COMMAND_DETACH_AT: u8 = 0x13;
 const COMMAND_TREE: u8 = 0x14;
+const COMMAND_ATTACH_EXTERNAL: u8 = 0x15;
 
 /// The longest payload that we accept, to not allocate what a broken peer announces.
 const MAX_PAYLOAD_SIZE: u32 = 1 << 16;
@@ -50,6 +51,15 @@ pub enum Command {
     DetachAt { path: PortPath },
     /// List the whole device tree.
     Tree,
+    /// Attach an external device at a port path. The file descriptor is one end of a connected
+    /// unix stream socket, on which another process serves the transfers of the device with
+    /// USB/IP framing.
+    AttachExternal {
+        path: PortPath,
+        speed: UsbSpeed,
+        name: Option<String>,
+        fd: File,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -74,6 +84,14 @@ struct AttachVirtualHidPayload {
 #[derive(Serialize, Deserialize)]
 struct DetachAtPayload {
     path: PortPath,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AttachExternalPayload {
+    path: PortPath,
+    speed: UsbSpeed,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
 }
 
 fn framed<T: Serialize>(id: u8, payload: &T) -> Result<Vec<u8>, CommandSendError> {
@@ -137,6 +155,22 @@ impl Command {
             ),
             Self::DetachAt { path } => (framed(id, &DetachAtPayload { path: *path })?, None),
             Self::Tree => (framed(id, &())?, None),
+            Self::AttachExternal {
+                path,
+                speed,
+                name,
+                fd,
+            } => (
+                framed(
+                    id,
+                    &AttachExternalPayload {
+                        path: *path,
+                        speed: *speed,
+                        name: name.clone(),
+                    },
+                )?,
+                Some(fd.as_raw_fd()),
+            ),
         };
 
         let transmitted = fd.map_or_else(
@@ -187,7 +221,8 @@ impl Command {
                 | COMMAND_ATTACH_HUB
                 | COMMAND_ATTACH_VIRTUAL_HID
                 | COMMAND_DETACH_AT
-                | COMMAND_TREE),
+                | COMMAND_TREE
+                | COMMAND_ATTACH_EXTERNAL),
                 file,
             ) => {
                 let payload = read_payload(&mut reader)?;
@@ -201,7 +236,18 @@ impl Command {
                             fd,
                         })
                     }
-                    (COMMAND_ATTACH_AT, None) => Err(CommandReceiveError::MissingFd),
+                    (COMMAND_ATTACH_AT | COMMAND_ATTACH_EXTERNAL, None) => {
+                        Err(CommandReceiveError::MissingFd)
+                    }
+                    (COMMAND_ATTACH_EXTERNAL, Some(fd)) => {
+                        let AttachExternalPayload { path, speed, name } = parse_payload(&payload)?;
+                        Ok(Self::AttachExternal {
+                            path,
+                            speed,
+                            name,
+                            fd,
+                        })
+                    }
                     (_, Some(_)) => Err(CommandReceiveError::UnexpectedFd),
                     (COMMAND_ATTACH_HUB, None) => {
                         let AttachHubPayload { path, spec } = parse_payload(&payload)?;
@@ -237,6 +283,7 @@ impl Command {
             Self::AttachVirtualHid { .. } => COMMAND_ATTACH_VIRTUAL_HID,
             Self::DetachAt { .. } => COMMAND_DETACH_AT,
             Self::Tree => COMMAND_TREE,
+            Self::AttachExternal { .. } => COMMAND_ATTACH_EXTERNAL,
         }
     }
 }
@@ -407,6 +454,97 @@ mod tests {
             Command::DetachAt { path: p } if p == path("5.1")
         ));
         assert!(matches!(transmit(Command::Tree).unwrap(), Command::Tree));
+    }
+
+    #[test]
+    fn attaching_an_external_device_carries_the_file_descriptor() {
+        let (socket, mut peer) = UnixStream::pair().unwrap();
+        match transmit(Command::AttachExternal {
+            path: path("5.1.1.4"),
+            speed: UsbSpeed::Full,
+            name: Some("Test keypad".to_string()),
+            fd: File::from(std::os::fd::OwnedFd::from(socket)),
+        })
+        .unwrap()
+        {
+            Command::AttachExternal {
+                path: received,
+                speed,
+                name,
+                fd,
+            } => {
+                assert_eq!(received, path("5.1.1.4"));
+                assert_eq!(speed, UsbSpeed::Full);
+                assert_eq!(name.as_deref(), Some("Test keypad"));
+                // The descriptor is the end of a socket that still talks to its peer.
+                let mut received_socket = UnixStream::from(std::os::fd::OwnedFd::from(fd));
+                received_socket.write_all(b"x").unwrap();
+                let mut byte = [0u8; 1];
+                peer.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                peer.read_exact(&mut byte).unwrap();
+                assert_eq!(byte, *b"x");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_name_of_an_external_device_is_optional() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut frame = vec![COMMAND_ATTACH_EXTERNAL];
+        let json = br#"{"path":"5.2.2","speed":"high"}"#;
+        frame.extend((json.len() as u32).to_le_bytes());
+        frame.extend(json);
+        client
+            .send_with_fd(&frame[..], a_file().as_raw_fd())
+            .unwrap();
+
+        match Command::receive_from_socket(&server).unwrap() {
+            Command::AttachExternal {
+                path: received,
+                speed: UsbSpeed::High,
+                name: None,
+                ..
+            } => assert_eq!(received, path("5.2.2")),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_external_device_needs_its_file_descriptor_and_a_speed() {
+        let (client, server) = UnixStream::pair().unwrap();
+        client
+            .send_with_fds(
+                &[&framed(
+                    COMMAND_ATTACH_EXTERNAL,
+                    &AttachExternalPayload {
+                        path: path("5"),
+                        speed: UsbSpeed::Full,
+                        name: None,
+                    },
+                )
+                .unwrap()[..]],
+                &[],
+            )
+            .unwrap();
+        assert!(matches!(
+            Command::receive_from_socket(&server),
+            Err(CommandReceiveError::MissingFd)
+        ));
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let json = br#"{"path":"5"}"#;
+        let mut frame = vec![COMMAND_ATTACH_EXTERNAL];
+        frame.extend((json.len() as u32).to_le_bytes());
+        frame.extend(json);
+        client
+            .send_with_fd(&frame[..], a_file().as_raw_fd())
+            .unwrap();
+        assert!(matches!(
+            Command::receive_from_socket(&server),
+            Err(CommandReceiveError::MalformedPayload(_))
+        ));
     }
 
     #[test]

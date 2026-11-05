@@ -144,6 +144,14 @@ fn handle_command(
                 .send_over_socket(socket)
                 .context("Failed to send the reply to the detach-at command")?;
         }
+        Command::AttachExternal { .. } => {
+            Reply::with_message(
+                Response::InvalidRequest,
+                "external devices are not supported yet",
+            )
+            .send_over_socket(socket)
+            .context("Failed to send the reply to the attach-external command")?;
+        }
         Command::Tree => {
             let tree = async_runtime
                 .block_on(hotplug_control.tree())
