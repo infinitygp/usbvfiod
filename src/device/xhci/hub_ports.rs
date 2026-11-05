@@ -8,11 +8,15 @@
 //! - A reset enables a connected port in the speed of the device below and reports the end of the
 //!   reset. It takes no time here.
 //! - Removing a device clears connection and enable and reports the change of the connection.
+//! - A hub whose upstream port is suspended is suspended itself. When its remote wakeup is enabled
+//!   and a device comes or goes, it resumes the upstream port, which the hub above reports as the
+//!   end of the suspend of that port. A driver that suspended an idle hub relies on this to learn
+//!   about a device that is plugged into the hub later.
 //!
 //! The controller side, which attaches and detaches the devices below the hub, uses a
 //! [`HubHandle`]. The control and interrupt endpoints of the hub device use the same state.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use tokio::sync::watch;
 use tracing::{debug, warn};
@@ -58,8 +62,16 @@ pub struct Stall;
 #[derive(Debug)]
 struct Child {
     speed: Speed,
-    /// The state of the child, if it is a hub, which a reset of the port resets.
+    /// The state of the child, if it is a hub, which a reset of the port resets and a suspend of
+    /// the port suspends.
     hub: Option<HubHandle>,
+}
+
+/// The port of the hub above that a hub is connected to.
+#[derive(Debug, Clone)]
+struct Upstream {
+    hub: Weak<HubShared>,
+    port: u8,
 }
 
 #[derive(Debug, Default)]
@@ -118,6 +130,10 @@ struct HubState {
     /// The bConfigurationValue of the current configuration, 0 if the hub is not configured.
     configuration: u8,
     remote_wakeup: bool,
+    /// The upstream port is suspended.
+    suspended: bool,
+    /// The hub above, if the hub is connected to the port of one.
+    upstream: Option<Upstream>,
     ports: Vec<Port>,
 }
 
@@ -145,6 +161,8 @@ impl HubShared {
             state: Mutex::new(HubState {
                 configuration: 0,
                 remote_wakeup: false,
+                suspended: false,
+                upstream: None,
                 ports: (0..ports).map(|_| Port::default()).collect(),
             }),
             changes: watch::channel(()).0,
@@ -190,6 +208,56 @@ impl HubShared {
         self.with_state(|state| state.remote_wakeup = enabled);
     }
 
+    fn set_suspended(&self, suspended: bool) {
+        self.with_state(|state| state.suspended = suspended);
+    }
+
+    fn set_upstream(&self, upstream: Option<Upstream>) {
+        self.with_state(|state| {
+            state.upstream = upstream;
+            state.suspended = false;
+        });
+    }
+
+    /// A suspended hub that may wake the bus resumes its upstream port, after a device came or
+    /// went.
+    fn wake_upstream(&self) {
+        let upstream = self.with_state(|state| {
+            if state.suspended && state.remote_wakeup {
+                state.suspended = false;
+                state.upstream.clone()
+            } else {
+                None
+            }
+        });
+        if let Some(parent) = upstream
+            .as_ref()
+            .and_then(|upstream| Some((upstream.hub.upgrade()?, upstream.port)))
+        {
+            parent.0.resume_from_below(parent.1);
+        }
+    }
+
+    /// The hub below on this port resumes: the end of the suspend of the port is a change that the
+    /// driver learns about, and a suspended hub passes the wakeup on to the hub above.
+    fn resume_from_below(&self, port: u8) {
+        let resumed = self.with_state(|state| {
+            state.port_mut(port).is_some_and(|port| {
+                let was_suspended = port.suspended;
+                if was_suspended {
+                    port.suspended = false;
+                    port.changes |= port_change::SUSPEND;
+                }
+                was_suspended
+            })
+        });
+        if resumed {
+            debug!("the hub below port {port} wakes the bus");
+            self.notify();
+            self.wake_upstream();
+        }
+    }
+
     /// The length in bytes of the status change bitmap: one bit for the hub and one per port.
     pub fn bitmap_length(&self) -> usize {
         usize::from(self.ports) / 8 + 1
@@ -225,7 +293,13 @@ impl HubShared {
     }
 
     pub fn set_port_feature(&self, port: u8, feature: u16) -> Result<(), Stall> {
-        let reset_child = self.with_state(|state| {
+        /// What the change of a port does to the hub below it.
+        enum HubBelow {
+            Reset(HubHandle),
+            Suspend(HubHandle),
+        }
+
+        let hub_below = self.with_state(|state| {
             let port = state.port_mut(port).ok_or(Stall)?;
             match feature {
                 port_feature::POWER => {
@@ -243,7 +317,11 @@ impl HubShared {
                         port.enabled = true;
                         port.suspended = false;
                         port.changes |= port_change::RESET;
-                        Ok(port.child.as_ref().and_then(|child| child.hub.clone()))
+                        Ok(port
+                            .child
+                            .as_ref()
+                            .and_then(|child| child.hub.clone())
+                            .map(HubBelow::Reset))
                     } else {
                         Ok(None)
                     }
@@ -251,8 +329,14 @@ impl HubShared {
                 port_feature::SUSPEND => {
                     if port.is_enabled() {
                         port.suspended = true;
+                        Ok(port
+                            .child
+                            .as_ref()
+                            .and_then(|child| child.hub.clone())
+                            .map(HubBelow::Suspend))
+                    } else {
+                        Ok(None)
                     }
-                    Ok(None)
                 }
                 port_feature::ENABLE => {
                     if port.connected() {
@@ -265,16 +349,20 @@ impl HubShared {
             }
         })?;
         self.notify();
-        // The reset reaches a hub below, whose state is another one than ours.
-        if let Some(hub) = reset_child {
-            hub.bus_reset();
+        // The hub below has a state of its own.
+        match hub_below {
+            Some(HubBelow::Reset(hub)) => hub.bus_reset(),
+            Some(HubBelow::Suspend(hub)) => hub.shared.set_suspended(true),
+            None => {}
         }
         Ok(())
     }
 
     pub fn clear_port_feature(&self, port: u8, feature: u16) -> Result<(), Stall> {
-        self.with_state(|state| {
+        let hub_below = self.with_state(|state| {
             let port = state.port_mut(port).ok_or(Stall)?;
+            let hub_below = port.child.as_ref().and_then(|child| child.hub.clone());
+            let mut hub_below_changes = None;
             match feature {
                 port_feature::ENABLE => {
                     // Disabling is not a port error, so it has no change to report.
@@ -286,9 +374,14 @@ impl HubShared {
                     if port.suspended {
                         port.suspended = false;
                         port.changes |= port_change::SUSPEND;
+                        hub_below_changes = Some(false);
                     }
                 }
-                port_feature::POWER => port.power_off(),
+                port_feature::POWER => {
+                    port.power_off();
+                    // The hub below lost its power.
+                    hub_below_changes = Some(true);
+                }
                 port_feature::C_CONNECTION => port.changes &= !port_change::CONNECTION,
                 port_feature::C_ENABLE => port.changes &= !port_change::ENABLE,
                 port_feature::C_SUSPEND => port.changes &= !port_change::SUSPEND,
@@ -296,9 +389,15 @@ impl HubShared {
                 port_feature::C_RESET => port.changes &= !port_change::RESET,
                 _ => return Err(Stall),
             }
-            Ok(())
+            Ok(hub_below.zip(hub_below_changes))
         })?;
         self.notify();
+        // `true`: the hub below lost its power, `false`: it resumes.
+        match hub_below {
+            Some((hub, true)) => hub.bus_reset(),
+            Some((hub, false)) => hub.shared.set_suspended(false),
+            None => {}
+        }
         Ok(())
     }
 }
@@ -326,44 +425,58 @@ impl HubHandle {
 
     /// A device connects to a downstream port. `hub` is the state of the device if it is a hub.
     pub fn connect(&self, port: u8, speed: Speed, hub: Option<Self>) {
-        let known = self.shared.with_state(|state| {
-            let Some(entry) = state.port_mut(port) else {
-                return false;
-            };
+        if let Some(hub) = &hub {
+            hub.shared.set_upstream(Some(Upstream {
+                hub: Arc::downgrade(&self.shared),
+                port,
+            }));
+        }
+        let reported = self.shared.with_state(|state| {
+            let entry = state.port_mut(port)?;
             entry.child = Some(Child { speed, hub });
             entry.enabled = false;
             entry.suspended = false;
             if entry.powered {
                 entry.changes |= port_change::CONNECTION;
             }
-            true
+            Some(entry.powered)
         });
-        if known {
-            self.shared.notify();
-        } else {
-            warn!("a device connects to port {port}, which the hub does not have");
+        match reported {
+            Some(powered) => self.device_changed(powered),
+            None => warn!("a device connects to port {port}, which the hub does not have"),
         }
     }
 
     /// The device on a downstream port is removed.
     pub fn disconnect(&self, port: u8) {
-        let known = self.shared.with_state(|state| {
-            let Some(entry) = state.port_mut(port) else {
-                return false;
-            };
+        let reported = self.shared.with_state(|state| {
+            let entry = state.port_mut(port)?;
             let was_connected = entry.connected();
-            entry.child = None;
+            let removed = entry.child.take();
             entry.enabled = false;
             entry.suspended = false;
             if was_connected {
                 entry.changes |= port_change::CONNECTION;
             }
-            true
+            Some((was_connected, removed))
         });
-        if known {
-            self.shared.notify();
-        } else {
-            warn!("a device disconnects from port {port}, which the hub does not have");
+        match reported {
+            Some((was_connected, removed)) => {
+                // A hub that is gone is not connected to this port anymore.
+                if let Some(hub) = removed.and_then(|child| child.hub) {
+                    hub.shared.set_upstream(None);
+                }
+                self.device_changed(was_connected);
+            }
+            None => warn!("a device disconnects from port {port}, which the hub does not have"),
+        }
+    }
+
+    /// A device came or went. A change that the driver learns about wakes a suspended hub.
+    fn device_changed(&self, reported: bool) {
+        self.shared.notify();
+        if reported {
+            self.shared.wake_upstream();
         }
     }
 
@@ -374,6 +487,7 @@ impl HubHandle {
         let hubs_below: Vec<Self> = self.shared.with_state(|state| {
             state.configuration = 0;
             state.remote_wakeup = false;
+            state.suspended = false;
             state
                 .ports
                 .iter_mut()
@@ -678,6 +792,163 @@ mod tests {
         outer.set_port_feature(1, port_feature::RESET).unwrap();
 
         assert_eq!(inner.configuration(), 0);
+    }
+
+    /// Two hubs, the inner one on port 1 of the outer one, with powered ports and the inner hub
+    /// suspended by its driver, which also armed its remote wakeup.
+    fn suspended_inner_hub() -> (Arc<HubShared>, HubHandle, Arc<HubShared>, HubHandle) {
+        let (outer, outer_handle) = hub(4, Speed::High);
+        let (inner, inner_handle) = hub(4, Speed::High);
+        power(&outer, 1);
+        outer_handle.connect(1, Speed::High, Some(inner_handle.clone()));
+        outer.set_port_feature(1, port_feature::RESET).unwrap();
+        for change in [port_feature::C_CONNECTION, port_feature::C_RESET] {
+            outer.clear_port_feature(1, change).unwrap();
+        }
+        power(&inner, 2);
+        inner.set_remote_wakeup(true);
+        outer.set_port_feature(1, port_feature::SUSPEND).unwrap();
+        assert_eq!(
+            status(&outer, 1).0 & port_status::SUSPEND,
+            port_status::SUSPEND
+        );
+        assert_eq!(outer.status_change_bitmap(), None);
+        (outer, outer_handle, inner, inner_handle)
+    }
+
+    #[test]
+    fn a_device_plugged_into_a_suspended_hub_wakes_it() {
+        let (outer, _, inner, inner_handle) = suspended_inner_hub();
+
+        inner_handle.connect(2, Speed::Full, None);
+
+        // The hub above reports the end of the suspend of the port, and the hub below the device.
+        let (status, changes) = status(&outer, 1);
+        assert_eq!(status & port_status::SUSPEND, 0);
+        assert_eq!(changes, port_change::SUSPEND);
+        assert_eq!(outer.status_change_bitmap(), Some(vec![1 << 1]));
+        assert_eq!(inner.status_change_bitmap(), Some(vec![1 << 2]));
+
+        // It is awake now: another device does not signal again.
+        outer
+            .clear_port_feature(1, port_feature::C_SUSPEND)
+            .unwrap();
+        power(&inner, 3);
+        inner_handle.connect(3, Speed::Full, None);
+        assert_eq!(outer.status_change_bitmap(), None);
+    }
+
+    #[test]
+    fn a_device_leaving_a_suspended_hub_wakes_it_too() {
+        let (outer, _, _, inner_handle) = suspended_inner_hub();
+        inner_handle.connect(2, Speed::Full, None);
+        outer
+            .clear_port_feature(1, port_feature::C_SUSPEND)
+            .unwrap();
+        outer.set_port_feature(1, port_feature::SUSPEND).unwrap();
+
+        inner_handle.disconnect(2);
+
+        assert_eq!(status(&outer, 1).1, port_change::SUSPEND);
+    }
+
+    #[test]
+    fn a_hub_does_not_wake_the_bus_without_remote_wakeup_or_when_it_is_not_suspended() {
+        let (outer, _, inner, inner_handle) = suspended_inner_hub();
+        inner.set_remote_wakeup(false);
+        inner_handle.connect(2, Speed::Full, None);
+        assert_eq!(outer.status_change_bitmap(), None);
+        assert_eq!(
+            status(&outer, 1).0 & port_status::SUSPEND,
+            port_status::SUSPEND,
+            "the port stays suspended"
+        );
+
+        // The driver resumes the port, which ends the suspend and tells the hub it is awake.
+        outer.clear_port_feature(1, port_feature::SUSPEND).unwrap();
+        outer
+            .clear_port_feature(1, port_feature::C_SUSPEND)
+            .unwrap();
+        inner.set_remote_wakeup(true);
+        power(&inner, 3);
+        inner_handle.connect(3, Speed::Full, None);
+        assert_eq!(outer.status_change_bitmap(), None);
+    }
+
+    #[test]
+    fn a_device_ports_that_is_not_powered_does_not_wake_the_hub() {
+        let (outer, _, _, inner_handle) = suspended_inner_hub();
+
+        // Port 4 of the inner hub has no power, so the hub does not see the device.
+        inner_handle.connect(4, Speed::Full, None);
+
+        assert_eq!(outer.status_change_bitmap(), None);
+    }
+
+    #[test]
+    fn the_wakeup_goes_up_through_all_suspended_hubs() {
+        let (top, top_handle) = hub(4, Speed::High);
+        let (middle, middle_handle) = hub(4, Speed::High);
+        let (bottom, bottom_handle) = hub(4, Speed::High);
+        top_handle.connect(1, Speed::High, Some(middle_handle));
+        middle_handle_connect(&middle, &bottom_handle);
+        // The drivers power the ports and reset the hubs, which resets the hubs below, and arm
+        // the wakeup afterwards.
+        power(&top, 1);
+        top.set_port_feature(1, port_feature::RESET).unwrap();
+        power(&middle, 1);
+        middle.set_port_feature(1, port_feature::RESET).unwrap();
+        power(&bottom, 1);
+        for hub in [&top, &middle, &bottom] {
+            hub.set_remote_wakeup(true);
+        }
+        top.set_port_feature(1, port_feature::SUSPEND).unwrap();
+        middle.set_port_feature(1, port_feature::SUSPEND).unwrap();
+        for hub in [&top, &middle] {
+            hub.clear_port_feature(1, port_feature::C_CONNECTION)
+                .unwrap();
+            hub.clear_port_feature(1, port_feature::C_RESET).unwrap();
+        }
+
+        bottom_handle.connect(1, Speed::Full, None);
+
+        assert_eq!(status(&middle, 1).1, port_change::SUSPEND);
+        assert_eq!(status(&top, 1).1, port_change::SUSPEND);
+        assert_eq!(top.status_change_bitmap(), Some(vec![1 << 1]));
+    }
+
+    /// Connect `bottom` to port 1 of `middle`, whose handle the test did not keep.
+    fn middle_handle_connect(middle: &Arc<HubShared>, bottom: &HubHandle) {
+        HubHandle::new(middle.clone()).connect(1, Speed::High, Some(bottom.clone()));
+    }
+
+    #[test]
+    fn a_hub_that_loses_its_power_or_is_reset_is_not_suspended_anymore() {
+        for lose_power in [false, true] {
+            let (outer, _, inner, inner_handle) = suspended_inner_hub();
+            if lose_power {
+                outer.clear_port_feature(1, port_feature::POWER).unwrap();
+                power(&outer, 1);
+                outer
+                    .clear_port_feature(1, port_feature::C_CONNECTION)
+                    .unwrap();
+            } else {
+                outer.set_port_feature(1, port_feature::RESET).unwrap();
+                outer.clear_port_feature(1, port_feature::C_RESET).unwrap();
+            }
+            // The hub below starts from scratch, with its remote wakeup and its power gone.
+            assert!(!inner.remote_wakeup());
+            inner.set_remote_wakeup(true);
+            power(&inner, 1);
+
+            inner_handle.connect(1, Speed::Full, None);
+
+            assert_eq!(
+                status(&outer, 1).1 & port_change::SUSPEND,
+                0,
+                "lose_power={lose_power}"
+            );
+        }
     }
 
     #[tokio::test]
