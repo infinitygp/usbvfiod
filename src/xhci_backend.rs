@@ -997,7 +997,7 @@ mod tests {
         .unwrap();
         let hotplug_control = backend.hotplug_control();
         async fn attach(control: &HotplugControl<CompleteRealDeviceImpl<VirtualHid, (u8, u8)>>) {
-            let device = CompleteRealDeviceImpl::new((9, 9), VirtualHid);
+            let device = CompleteRealDeviceImpl::new((9, 9), VirtualHid::default());
             info!("attach: {:?}", control.attach(device).await);
         }
         attach(&hotplug_control).await;

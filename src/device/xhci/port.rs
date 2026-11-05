@@ -1,4 +1,4 @@
-use std::{array, mem, sync::Arc};
+use std::{array, sync::Arc};
 
 use anyhow::anyhow;
 use tokio::{
@@ -7,13 +7,15 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
-use usbvfiod::hotplug_protocol::response::Response;
+use usbvfiod::hotplug_protocol::{port_path::PortPath, response::Response};
 
 use crate::{
     device::{
         pci::constants::xhci::{offset, operational::portsc, MAX_PORTS, NUM_USB3_PORTS},
         xhci::{
             controller_reset::ResetSender,
+            device_tree::{DeviceInstanceId, DeviceTree, Node},
+            hub_ports::HubHandle,
             interrupter::EventSender,
             real_device::{CompleteRealDevice, RealDevice, Speed},
             registers::{PortpmscRegister, PortscRegister},
@@ -48,7 +50,7 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
         let (msg_sender, msg_recv) = mpsc::unbounded_channel();
 
         let worker = PortWorker {
-            devices: [const { None }; MAX_PORTS as usize].into(),
+            devices: DeviceTree::new(),
             portsc: portsc.clone(),
             portpmsc: portpmsc.clone(),
             event_sender,
@@ -67,7 +69,15 @@ impl<CRD: CompleteRealDevice> PortArray<CRD> {
     }
 
     pub fn write_portsc(&self, port_id: usize, value: u64) -> anyhow::Result<()> {
-        self.portsc[port_id].write(value)
+        self.portsc[port_id].write(value)?;
+
+        if value & portsc::PR != 0 {
+            // The reset of the port reaches a hub on it, which starts from scratch.
+            self.msg_sender
+                .send(PortMessage::RootPortReset(port_id as u8))
+                .map_err(|_| anyhow!("port channel closed"))?;
+        }
+        Ok(())
     }
 
     pub fn read_portsc(&self, port_id: usize) -> u64 {
@@ -124,7 +134,7 @@ impl<CRD: CompleteRealDevice> ResetSender for PortArrayResetSender<CRD> {
 
 #[derive(Debug)]
 struct PortWorker<CRD: CompleteRealDevice> {
-    devices: OneIndexed<Option<AttachedDevice<CRD>>, { MAX_PORTS as usize }>,
+    devices: DeviceTree<CRD>,
     portsc: Arc<OneIndexed<PortscRegister, { MAX_PORTS as usize }>>,
     portpmsc: Arc<OneIndexed<PortpmscRegister, { MAX_PORTS as usize }>>,
     event_sender: EventSender,
@@ -134,26 +144,30 @@ struct PortWorker<CRD: CompleteRealDevice> {
     async_runtime: runtime::Handle,
 }
 
-/// The detach token is created once per device instance and cloned by its users, so its identity
-/// distinguishes attached device lifecycles. Token cancellation does not change this identity.
+/// A device in the tree, as listed by [`HotplugControl::tree`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeviceInstanceId(CancellationToken);
-
-#[derive(Debug)]
-struct AttachedDevice<CRD: CompleteRealDevice> {
-    device: Arc<CRD>,
-    // The lifecycle ID of this attached device instance.
-    instance_id: DeviceInstanceId,
+pub struct TreeNode<ID> {
+    pub path: PortPath,
+    pub id: ID,
+    pub speed: Speed,
+    /// The number of downstream ports, for a hub.
+    pub hub_ports: Option<u8>,
 }
 
 #[derive(Debug)]
 pub enum PortMessage<CRD: CompleteRealDevice> {
-    Attach(CRD, oneshot::Sender<Response>),
+    // Attaches a device at a port path, or on the first free root port that fits its speed.
+    Attach(Option<PortPath>, CRD, oneshot::Sender<Response>),
     // Detaches a device, optionally limited to a specific attached device lifecycle.
     Detach(CRD::ID, Option<DeviceInstanceId>, oneshot::Sender<Response>),
+    // Detaches the device at a port path with everything below it.
+    DetachAt(PortPath, oneshot::Sender<Response>),
     ListAttached(oneshot::Sender<Vec<CRD::ID>>),
-    // port id
-    GetDevice(usize, oneshot::Sender<Option<Arc<CRD>>>),
+    ListTree(oneshot::Sender<Vec<TreeNode<CRD::ID>>>),
+    // root hub port number, route string
+    GetDevice(u8, u32, oneshot::Sender<Option<Arc<CRD>>>),
+    // The upstream port of a hub on the root port is reset
+    RootPortReset(u8),
     // Host Controller Reset
     ResetPorts(oneshot::Sender<()>),
 }
@@ -170,21 +184,30 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
     async fn run_loop(&mut self) -> anyhow::Result<()> {
         loop {
             match self.next_msg().await? {
-                PortMessage::Attach(device, responder) => {
-                    responder.send_anyhow(self.attach(device)?)?;
+                PortMessage::Attach(path, device, responder) => {
+                    responder.send_anyhow(self.attach(path, device)?)?;
                 }
                 PortMessage::Detach(identifier, instance_id, responder) => {
                     responder.send_anyhow(self.detach(identifier, instance_id)?)?;
                 }
+                PortMessage::DetachAt(path, responder) => {
+                    responder.send_anyhow(self.detach_at(&path)?)?;
+                }
                 PortMessage::ListAttached(responder) => {
                     responder.send_anyhow(self.attached_devices())?;
                 }
-                PortMessage::GetDevice(port_id, responder) => {
+                PortMessage::ListTree(responder) => {
+                    responder.send_anyhow(self.tree())?;
+                }
+                PortMessage::GetDevice(root_port, route_string, responder) => {
                     let device = self
                         .devices
-                        .get(port_id)
-                        .and_then(|opt| opt.as_ref().map(|attached| attached.device.clone()));
+                        .lookup(root_port, route_string)
+                        .map(|node| node.device.clone());
                     responder.send_anyhow(device)?;
+                }
+                PortMessage::RootPortReset(port_id) => {
+                    self.devices.reset_hub_on_root_port(port_id);
                 }
                 PortMessage::ResetPorts(completion) => {
                     self.reset_ports()?;
@@ -201,12 +224,12 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
             .ok_or_else(|| anyhow!("port channel closed"))
     }
 
-    fn attach(&mut self, device: CRD) -> anyhow::Result<Response> {
-        if self.attached_devices().contains(&device.identifier()) {
+    fn attach(&mut self, path: Option<PortPath>, device: CRD) -> anyhow::Result<Response> {
+        if let Some(existing) = self.path_of(device.identifier(), None) {
             info!(
                 "A device with the same identifier is already attached and will be detached first"
             );
-            self.detach(device.identifier(), None)?;
+            self.detach_at(&existing)?;
         }
 
         let speed = match device.realdevice_ref().speed() {
@@ -215,38 +238,50 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         };
         let version = UsbVersion::from_speed(speed);
 
-        let available_port_id = match (1..=MAX_PORTS as usize)
-                .find(|&i| {
-                    self.devices[i].is_none()
+        let path = match path {
+            Some(path) => path,
+            None => {
+                let available_port_id = match (1..=MAX_PORTS as usize).find(|&i| {
+                    self.devices.root_port_is_free(i as u8)
                         && self.portsc[i].usb_version() == version
-                }) // filter USB2/3
-                {
+                }) {
                     Some(port) => port,
                     None => return Ok(Response::NoFreePort),
                 };
+                PortPath::root(available_port_id as u8).expect("root port numbers start at 1")
+            }
+        };
+        let root_port = path.root_port() as usize;
+        match self.portsc.get(root_port) {
+            Some(portsc) if portsc.usb_version() != version => {
+                return Ok(Response::SpeedNotSupported)
+            }
+            Some(_) => {}
+            None => return Ok(Response::NoSuchPath),
+        }
 
         let identifier = device.identifier();
-        let instance_id = DeviceInstanceId(device.detach_token());
+        let node = Node::new(device);
+        let instance_id = node.instance_id.clone();
+        let detach_token = node.device.detach_token();
+        if let Err(response) = self.devices.attach(path, node, speed) {
+            return Ok(response);
+        }
         self.async_runtime.spawn(detach_listener(
-            device.detach_token(),
+            detach_token,
             identifier,
-            instance_id.clone(),
+            instance_id,
             self.msg_sender.clone(),
         ));
 
-        self.devices[available_port_id] = Some(AttachedDevice {
-            device: Arc::new(device),
-            instance_id,
-        });
+        if path.is_root() {
+            self.portsc[root_port].set(connected_portsc(version, speed));
 
-        self.portsc[available_port_id].set(connected_portsc(version, speed));
+            let event = EventTrb::new_port_status_change_event_trb(path.root_port());
+            self.event_sender.send(event)?;
+        }
 
-        info!(
-            "Attached {speed} device {identifier:?} to port {available_port_id} ({version:?} port)"
-        );
-
-        let event = EventTrb::new_port_status_change_event_trb(available_port_id as u8);
-        self.event_sender.send(event)?;
+        info!("Attached {speed} device {identifier:?} at port path {path} ({version:?} root port)");
 
         Ok(Response::SuccessfulOperation)
     }
@@ -258,10 +293,14 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
     /// reset. It cannot go onto an event ring yet, but it sets USBSTS.PCD for the driver, which
     /// also looks at the ports on its own.
     fn reset_ports(&self) -> anyhow::Result<()> {
+        // The hubs lose their power, too.
+        self.devices.reset_hubs();
+
         for port_id in 1..=MAX_PORTS as usize {
-            let speed = self.devices[port_id]
-                .as_ref()
-                .and_then(|attached| attached.device.realdevice_ref().speed());
+            let speed = PortPath::root(port_id as u8)
+                .ok()
+                .and_then(|path| self.devices.node(&path))
+                .and_then(Node::speed);
             let value = speed.map_or(portsc::PP | portsc::value::PLS_RXDETECT, |speed| {
                 connected_portsc(self.portsc[port_id].usb_version(), speed)
             });
@@ -279,10 +318,44 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
 
     fn attached_devices(&self) -> Vec<CRD::ID> {
         self.devices
-            .iter()
-            .filter_map(|dev| dev.as_ref())
-            .map(|attached| attached.device.identifier())
+            .nodes()
+            .into_iter()
+            .map(|(_, node)| node.device.identifier())
             .collect()
+    }
+
+    fn tree(&self) -> Vec<TreeNode<CRD::ID>> {
+        self.devices
+            .nodes()
+            .into_iter()
+            .filter_map(|(path, node)| {
+                Some(TreeNode {
+                    path,
+                    id: node.device.identifier(),
+                    speed: node.speed()?,
+                    hub_ports: node.hub_handle().map(HubHandle::ports),
+                })
+            })
+            .collect()
+    }
+
+    /// The path of the device with an identifier, optionally limited to a particular attach
+    /// lifecycle.
+    fn path_of(
+        &self,
+        id: CRD::ID,
+        requested_instance_id: Option<DeviceInstanceId>,
+    ) -> Option<PortPath> {
+        self.devices
+            .nodes()
+            .into_iter()
+            .find(|(_, node)| {
+                let instance_id_matches = requested_instance_id
+                    .as_ref()
+                    .is_none_or(|requested_instance_id| requested_instance_id == &node.instance_id);
+                node.device.identifier() == id && instance_id_matches
+            })
+            .map(|(path, _)| path)
     }
 
     /// Detach a device by identifier, optionally requiring a particular attach lifecycle.
@@ -295,28 +368,8 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
         id: CRD::ID,
         requested_instance_id: Option<DeviceInstanceId>,
     ) -> anyhow::Result<Response> {
-        // find out on which port the device is connected
-        let port_id = match self
-            .devices
-            .enumerate()
-            .filter_map(|(i, port)| {
-                port.as_ref().and_then(|attached| {
-                    let instance_id_matches =
-                        requested_instance_id
-                            .as_ref()
-                            .is_none_or(|requested_instance_id| {
-                                requested_instance_id == &attached.instance_id
-                            });
-                    (attached.device.identifier() == id && instance_id_matches).then_some(i)
-                })
-            })
-            .next()
-        {
-            Some(i) => {
-                debug!("Device to detach is connected to port {i}");
-                i
-            }
-            None => {
+        self.path_of(id, requested_instance_id).map_or_else(
+            || {
                 // This message is expected once per soft detach:
                 // - this handler runs
                 // - cancels the detach token
@@ -329,29 +382,38 @@ impl<CRD: CompleteRealDevice> PortWorker<CRD> {
                 // However, this message will also be printed when detach command for unknown identifier
                 // is received.
                 debug!("Could not find the device to detach");
-                return Ok(Response::NoSuchDevice);
-            }
+                Ok(Response::NoSuchDevice)
+            },
+            |path| {
+                debug!("Device to detach is connected at port path {path}");
+                self.detach_at(&path)
+            },
+        )
+    }
+
+    /// Detach the device at a port path, with the devices below it if it is a hub.
+    fn detach_at(&mut self, path: &PortPath) -> anyhow::Result<Response> {
+        let Some(node) = self.devices.detach(path) else {
+            debug!("There is no device at port path {path}");
+            return Ok(Response::NoSuchDevice);
         };
+        let identifier = node.device.identifier();
 
         // inform everybody else (endpoint handles) about the detach, so that they can drop
-        // their reference of the device, too. This operation also removes the device from
-        // the devices array.
-        //
-        // Safety: just determined that this port_id refers to the device we want to detach
-        mem::take(&mut self.devices[port_id])
-            .unwrap()
-            .device
-            .detach_token()
-            .cancel();
+        // their reference of the device, too. This includes the devices below a hub.
+        node.cancel_detach_tokens();
 
-        // update portsc register
-        self.portsc[port_id].set(portsc::PP | portsc::CSC);
+        if path.is_root() {
+            let port_id = path.root_port();
+            // update portsc register
+            self.portsc[usize::from(port_id)].set(portsc::PP | portsc::CSC);
 
-        // send port status change event
-        let event = EventTrb::new_port_status_change_event_trb(port_id as u8);
-        self.event_sender.send(event)?;
+            // send port status change event
+            let event = EventTrb::new_port_status_change_event_trb(port_id);
+            self.event_sender.send(event)?;
+        }
 
-        info!("Detached device {id:?} from port {port_id}");
+        info!("Detached device {identifier:?} from port path {path}");
 
         Ok(Response::SuccessfulOperation)
     }
@@ -444,9 +506,39 @@ pub struct HotplugControl<CRD: CompleteRealDevice> {
 }
 
 impl<CRD: CompleteRealDevice> HotplugControl<CRD> {
+    /// Attach a device on the first free root port that fits its speed.
     pub async fn attach(&self, device: CRD) -> Response {
+        self.attach_at_path(None, device).await
+    }
+
+    /// Attach a device at a port path. The hubs on the way must exist.
+    pub async fn attach_at(&self, path: PortPath, device: CRD) -> Response {
+        self.attach_at_path(Some(path), device).await
+    }
+
+    async fn attach_at_path(&self, path: Option<PortPath>, device: CRD) -> Response {
         let (responder, response_recv) = oneshot::channel();
-        let msg = PortMessage::Attach(device, responder);
+        let msg = PortMessage::Attach(path, device, responder);
+        self.msg_send.send(msg).expect("channel should never close");
+        response_recv
+            .await
+            .expect("oneshot channel should always provide a message")
+    }
+
+    /// Detach the device at a port path, with the devices below it if it is a hub.
+    pub async fn detach_at(&self, path: PortPath) -> Response {
+        let (responder, response_recv) = oneshot::channel();
+        let msg = PortMessage::DetachAt(path, responder);
+        self.msg_send.send(msg).expect("channel should never close");
+        response_recv
+            .await
+            .expect("oneshot channel should always provide a message")
+    }
+
+    /// All devices with their port paths, every hub before the devices below it.
+    pub async fn tree(&self) -> Vec<TreeNode<CRD::ID>> {
+        let (responder, response_recv) = oneshot::channel();
+        let msg = PortMessage::ListTree(responder);
         self.msg_send.send(msg).expect("channel should never close");
         response_recv
             .await
@@ -478,10 +570,15 @@ pub struct DeviceRetriever<CRD: CompleteRealDevice> {
 }
 
 impl<CRD: CompleteRealDevice> DeviceRetriever<CRD> {
-    pub async fn get_device(&self, port_id: u8) -> anyhow::Result<Option<Arc<CRD>>> {
+    /// The device that a slot context describes with its root hub port number and route string.
+    pub async fn get_device(
+        &self,
+        root_port: u8,
+        route_string: u32,
+    ) -> anyhow::Result<Option<Arc<CRD>>> {
         let (send, recv) = oneshot::channel();
         self.msg_send
-            .send(PortMessage::GetDevice(port_id as usize, send))?;
+            .send(PortMessage::GetDevice(root_port, route_string, send))?;
         let device = recv.await?;
 
         Ok(device)
@@ -628,5 +725,291 @@ mod tests {
             .expect("local timeout on await"),
             vec![IDENTIFIER]
         );
+    }
+
+    mod tree {
+        use super::*;
+        use crate::device::xhci::{
+            hub_ports::{port_feature, HubShared},
+            real_device::tests::testutils::MockRealDeviceWithSpeed,
+        };
+
+        type TreeDevice = CompleteRealDeviceImpl<MockRealDeviceWithSpeed, (u8, u8)>;
+        type TreePortArray = PortArray<TreeDevice>;
+
+        fn path(text: &str) -> PortPath {
+            text.parse().unwrap()
+        }
+
+        fn device(id: u8, speed: Speed) -> TreeDevice {
+            CompleteRealDeviceImpl::new((id, id), MockRealDeviceWithSpeed(speed))
+        }
+
+        fn hub(id: u8, ports: u8, speed: Speed) -> (TreeDevice, Arc<HubShared>) {
+            let shared = Arc::new(HubShared::new(ports, speed));
+            (
+                device(id, speed).with_hub(HubHandle::new(shared.clone())),
+                shared,
+            )
+        }
+
+        fn port_array() -> (
+            TreePortArray,
+            crate::device::xhci::interrupter::tests::testutils::MockInterrupter,
+        ) {
+            let (event_sender, interrupter) = MockInterrupter::new();
+            (PortArray::new(event_sender, Handle::current()), interrupter)
+        }
+
+        async fn eventually<T>(mut f: impl AsyncFnMut() -> Option<T>) -> T {
+            for _ in 0..300 {
+                if let Some(value) = f().await {
+                    return value;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            panic!("the condition did not become true");
+        }
+
+        #[tokio::test]
+        async fn a_hub_on_a_root_port_holds_devices_that_are_found_by_route_string() {
+            let (port_array, mut interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let retriever = port_array.create_device_retriever();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            let hub_token = hub_device.detach_token();
+            let child = device(2, Speed::Full);
+            let child_token = child.detach_token();
+
+            assert_eq!(
+                control.attach_at(path("5"), hub_device).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(
+                interrupter.await_event().await,
+                Some(EventTrb::new_port_status_change_event_trb(5))
+            );
+            assert_eq!(
+                control.attach_at(path("5.2"), child).await,
+                Response::SuccessfulOperation
+            );
+            // The hub tells its driver, not the root port.
+            assert!(interrupter.is_empty());
+            assert_eq!(hub_shared.port_status(2).unwrap()[0] & 1, 0, "not powered");
+            hub_shared.set_port_feature(2, port_feature::POWER).unwrap();
+            assert_eq!(hub_shared.status_change_bitmap(), Some(vec![1 << 2]));
+
+            let tree = control.tree().await;
+            assert_eq!(
+                tree,
+                [
+                    TreeNode {
+                        path: path("5"),
+                        id: (1, 1),
+                        speed: Speed::High,
+                        hub_ports: Some(4)
+                    },
+                    TreeNode {
+                        path: path("5.2"),
+                        id: (2, 2),
+                        speed: Speed::Full,
+                        hub_ports: None
+                    },
+                ]
+            );
+            let found = async |root, route| {
+                retriever
+                    .get_device(root, route)
+                    .await
+                    .unwrap()
+                    .map(|device| device.identifier())
+            };
+            assert_eq!(found(5, 0).await, Some((1, 1)));
+            assert_eq!(found(5, 0x2).await, Some((2, 2)));
+            assert_eq!(found(5, 0x3).await, None);
+            assert_eq!(found(5, 0x22).await, None);
+            assert_eq!(found(6, 0).await, None);
+
+            // Detaching the hub takes the device below with it.
+            assert_eq!(
+                control.detach_at(path("5")).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(
+                interrupter.await_event().await,
+                Some(EventTrb::new_port_status_change_event_trb(5))
+            );
+            assert!(hub_token.is_cancelled());
+            assert!(child_token.is_cancelled());
+            assert_eq!(control.tree().await, []);
+            assert_eq!(control.list_devices().await, []);
+            assert_eq!(found(5, 0x2).await, None);
+            assert_eq!(control.detach_at(path("5")).await, Response::NoSuchDevice);
+        }
+
+        #[tokio::test]
+        async fn attaching_at_a_path_checks_the_port_and_the_speed() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (full_hub, _) = hub(1, 2, Speed::Full);
+            assert_eq!(
+                control.attach_at(path("6"), full_hub).await,
+                Response::SuccessfulOperation
+            );
+
+            let checks = [
+                ("6.1", device(2, Speed::High), Response::SpeedNotSupported),
+                ("6.3", device(3, Speed::Full), Response::NoSuchPath),
+                ("6.1.1", device(4, Speed::Full), Response::NoSuchPath),
+                ("7.1", device(5, Speed::Full), Response::NoSuchPath),
+                ("9", device(6, Speed::Full), Response::NoSuchPath),
+                ("6", device(7, Speed::Full), Response::PathOccupied),
+                // A super speed device does not go to a USB 2 port, and a USB 2 device does not
+                // go to a USB 3 port.
+                ("5", device(8, Speed::Super), Response::SpeedNotSupported),
+                ("1", device(9, Speed::Full), Response::SpeedNotSupported),
+            ];
+            for (at, device, expected) in checks {
+                assert_eq!(control.attach_at(path(at), device).await, expected, "{at}");
+            }
+            assert_eq!(
+                control.attach_at(path("6.2"), device(10, Speed::Low)).await,
+                Response::SuccessfulOperation
+            );
+            assert_eq!(
+                control.attach_at(path("1"), device(11, Speed::Super)).await,
+                Response::SuccessfulOperation
+            );
+            // Only what was accepted is in the tree.
+            let paths: Vec<_> = control
+                .tree()
+                .await
+                .into_iter()
+                .map(|node| node.path.to_string())
+                .collect();
+            assert_eq!(paths, ["1", "6", "6.2"]);
+        }
+
+        #[tokio::test]
+        async fn a_device_without_a_path_goes_to_the_first_free_root_port_of_its_version() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+
+            for (id, speed, expected) in [
+                (1, Speed::Super, "1"),
+                (2, Speed::High, "5"),
+                (3, Speed::Full, "6"),
+                (4, Speed::Super, "2"),
+            ] {
+                assert_eq!(
+                    control.attach(device(id, speed)).await,
+                    Response::SuccessfulOperation
+                );
+                let tree = control.tree().await;
+                assert_eq!(
+                    tree.iter()
+                        .find(|node| node.id == (id, id))
+                        .unwrap()
+                        .path
+                        .to_string(),
+                    expected
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn a_device_below_a_hub_is_detached_by_its_identifier_or_by_its_token() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            control.attach_at(path("5"), hub_device).await;
+            control.attach_at(path("5.1"), device(2, Speed::Full)).await;
+            let third = device(3, Speed::Full);
+            let third_token = third.detach_token();
+            control.attach_at(path("5.2"), third).await;
+            for port in 1..=2 {
+                hub_shared
+                    .set_port_feature(port, port_feature::POWER)
+                    .unwrap();
+            }
+
+            assert_eq!(control.detach((2, 2)).await, Response::SuccessfulOperation);
+            assert_eq!(control.detach((2, 2)).await, Response::NoSuchDevice);
+            // The hub reports the removal to its driver.
+            assert_eq!(hub_shared.port_status(1).unwrap()[2] & 1, 1);
+
+            // A device that goes away by itself, like one that was unplugged on the host.
+            third_token.cancel();
+            eventually(async || (control.tree().await.len() == 1).then_some(())).await;
+            assert_eq!(hub_shared.port_status(2).unwrap()[2] & 1, 1);
+        }
+
+        #[tokio::test]
+        async fn a_device_that_is_attached_again_replaces_the_old_one_with_the_same_identifier() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            control.attach_at(path("5"), hub(1, 4, Speed::High).0).await;
+            control.attach_at(path("5.1"), device(2, Speed::Full)).await;
+
+            assert_eq!(
+                control.attach_at(path("5.3"), device(2, Speed::Full)).await,
+                Response::SuccessfulOperation
+            );
+
+            let paths: Vec<_> = control
+                .tree()
+                .await
+                .into_iter()
+                .map(|node| node.path.to_string())
+                .collect();
+            assert_eq!(paths, ["5", "5.3"]);
+        }
+
+        #[tokio::test]
+        async fn a_reset_of_the_root_port_resets_the_hub_on_it() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            let (other_device, other_shared) = hub(2, 4, Speed::High);
+            control.attach_at(path("5"), hub_device).await;
+            control.attach_at(path("6"), other_device).await;
+            hub_shared.set_configuration(1);
+            other_shared.set_configuration(1);
+
+            port_array.write_portsc(5, portsc::PR).unwrap();
+            // The worker handles the messages in order, so the answer to this one comes after.
+            control.list_devices().await;
+
+            assert_eq!(hub_shared.configuration(), 0);
+            assert_eq!(other_shared.configuration(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_host_controller_reset_resets_all_hubs_but_keeps_the_devices() {
+            let (port_array, _interrupter) = port_array();
+            let control = port_array.create_hotplug_control();
+            let (hub_device, hub_shared) = hub(1, 4, Speed::High);
+            control.attach_at(path("5"), hub_device).await;
+            control.attach_at(path("5.1"), device(2, Speed::Full)).await;
+            hub_shared.set_configuration(1);
+            hub_shared.set_port_feature(1, port_feature::POWER).unwrap();
+
+            timeout(
+                Duration::from_secs(ASYNC_TIMEOUT_SECS),
+                port_array.reset_sender().reset().unwrap(),
+            )
+            .await
+            .expect("local timeout on await")
+            .unwrap();
+
+            assert_eq!(hub_shared.configuration(), 0);
+            assert_eq!(hub_shared.port_status(1).unwrap(), [0, 0, 0, 0]);
+            assert_eq!(control.tree().await.len(), 2);
+            assert_eq!(
+                port_array.read_portsc(5) & portsc::CCS,
+                portsc::CCS,
+                "the hub is connected to its root port"
+            );
+        }
     }
 }

@@ -396,6 +396,19 @@ struct Slot {
     ep_launch_requester: LaunchRequester,
 }
 
+/// The fields of the output slot context that a Configure Endpoint command takes from the input
+/// slot context when A0 is set (xHCI 4.6.6): Context Entries, Hub and MTT (dword 0), Number of
+/// Ports (dword 1), and TT Think Time (dword 2).
+const CONFIGURE_ENDPOINT_SLOT_FIELDS: [u32; 3] = [0xfe00_0000, 0xff00_0000, 0x0003_0000];
+
+/// The fields of the output slot context that an Evaluate Context command takes from the input slot
+/// context when A0 is set (xHCI 4.6.7): Max Exit Latency (dword 1) and Interrupter Target
+/// (dword 2).
+const EVALUATE_CONTEXT_SLOT_FIELDS: [u32; 3] = [0, 0x0000_ffff, 0xffc0_0000];
+
+/// Slot context dword 0 holds the route string in its lowest 20 bits.
+const ROUTE_STRING_MASK: u64 = 0xf_ffff;
+
 #[derive(Debug)]
 enum SlotState {
     Enabled,
@@ -604,6 +617,26 @@ impl Slot {
         )) as u8
     }
 
+    /// The route string of the device: the hub ports from the root hub to the device, 4 bits each,
+    /// with the port of the first hub in the lowest nibble.
+    fn route_string(&self, base_address: u64) -> u32 {
+        (self
+            .dma_bus
+            .read(Request::new(base_address, RequestSize::Size4))
+            & ROUTE_STRING_MASK) as u32
+    }
+
+    /// Copy the fields of the input slot context that a command evaluates into the output slot
+    /// context. `fields` has the bits to take for each dword of the slot context.
+    fn update_slot_context(&self, input_context_pointer: u64, base_address: u64, fields: [u32; 3]) {
+        update_context_dwords(
+            &self.dma_bus,
+            input_context_pointer.wrapping_add(32),
+            base_address,
+            fields,
+        );
+    }
+
     async fn handle_configure_endpoint(
         &mut self,
         input_context_pointer: u64,
@@ -644,6 +677,14 @@ impl Slot {
 
             self.state = SlotState::Addressed(base_address);
         } else {
+            if add_flags & 1 != 0 {
+                self.update_slot_context(
+                    input_context_pointer,
+                    base_address,
+                    CONFIGURE_ENDPOINT_SLOT_FIELDS,
+                );
+            }
+
             let mut to_deconfigure = Vec::new();
             let mut to_configure = Vec::new();
 
@@ -709,6 +750,7 @@ impl Slot {
                 self.id,
                 endpoint_id,
                 self.root_hub_port(base_address),
+                self.route_string(base_address),
                 context,
             )
             .await?;
@@ -721,12 +763,30 @@ impl Slot {
         &self,
         input_context_pointer: u64,
     ) -> anyhow::Result<CompletionCode> {
-        warn!("handle_evaluate_context is not yet implemented. Just confirming valid context and then reporting success.");
-
         // we should not touch anything if the input is bad
         if !self.check_device_context(input_context_pointer) {
             return Ok(CompletionCode::ParameterError);
         }
+
+        let add_flags = self.dma_bus.read(Request::new(
+            input_context_pointer.wrapping_add(4),
+            RequestSize::Size4,
+        ));
+        match self.state {
+            SlotState::Default(base_address)
+            | SlotState::Addressed(base_address)
+            | SlotState::Configured(base_address)
+                if add_flags & 1 != 0 =>
+            {
+                self.update_slot_context(
+                    input_context_pointer,
+                    base_address,
+                    EVALUATE_CONTEXT_SLOT_FIELDS,
+                );
+            }
+            _ => {}
+        }
+        debug!("Evaluate Context only evaluates the slot context. The endpoint contexts are just confirmed.");
 
         Ok(CompletionCode::Success)
     }
@@ -765,6 +825,29 @@ impl Slot {
         self.write_slot_state();
 
         Ok(CompletionCode::Success)
+    }
+}
+
+/// Merge dwords of a context in guest memory into another one.
+///
+/// For each dword, the bits that are set in the corresponding entry of `fields` are taken from the
+/// context at `source`, and the other bits of the context at `destination` stay as they are.
+fn update_context_dwords(dma_bus: &BusDeviceRef, source: u64, destination: u64, fields: [u32; 3]) {
+    for (index, mask) in fields.into_iter().enumerate() {
+        if mask == 0 {
+            continue;
+        }
+        let offset = index as u64 * 4;
+        let new = dma_bus.read(Request::new(
+            source.wrapping_add(offset),
+            RequestSize::Size4,
+        )) as u32;
+        let address = destination.wrapping_add(offset);
+        let old = dma_bus.read(Request::new(address, RequestSize::Size4)) as u32;
+        dma_bus.write(
+            Request::new(address, RequestSize::Size4),
+            u64::from(old & !mask | new & mask),
+        );
     }
 }
 
@@ -980,6 +1063,75 @@ impl SlotWorkerHandle {
         self.msg_send.send(msg)?;
         let completion_code = recv.await?;
         Ok(completion_code)
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::device::bus::testutils::TestBusDevice;
+
+    const INPUT_SLOT_CONTEXT: u64 = 0x120;
+    const OUTPUT_SLOT_CONTEXT: u64 = 0x400;
+
+    fn ram_with_slot_contexts(input: [u32; 3], output: [u32; 3]) -> Arc<TestBusDevice> {
+        let ram = Arc::new(TestBusDevice::new(&[0u8; 0x800]));
+        for (index, (new, old)) in input.into_iter().zip(output).enumerate() {
+            ram.write_bulk(INPUT_SLOT_CONTEXT + index as u64 * 4, &new.to_le_bytes());
+            ram.write_bulk(OUTPUT_SLOT_CONTEXT + index as u64 * 4, &old.to_le_bytes());
+        }
+        ram
+    }
+
+    fn output_dwords(ram: &TestBusDevice) -> [u32; 3] {
+        [0, 4, 8].map(|offset| {
+            let mut bytes = [0u8; 4];
+            ram.read_bulk(OUTPUT_SLOT_CONTEXT + offset, &mut bytes);
+            u32::from_le_bytes(bytes)
+        })
+    }
+
+    #[test]
+    fn configure_endpoint_takes_the_hub_fields_and_leaves_the_route_and_port_alone() {
+        // The output context has the route string 0x41 and the root hub port 5.
+        let ram = ram_with_slot_contexts([u32::MAX; 3], [0x0000_0041, 0x0005_0000, 0x0000_0000]);
+        let bus: BusDeviceRef = ram.clone();
+
+        update_context_dwords(
+            &bus,
+            INPUT_SLOT_CONTEXT,
+            OUTPUT_SLOT_CONTEXT,
+            CONFIGURE_ENDPOINT_SLOT_FIELDS,
+        );
+
+        assert_eq!(
+            output_dwords(&ram),
+            [
+                // Context Entries, Hub and MTT are new, the route string stays.
+                0xfe00_0041,
+                // The number of ports is new, the root hub port and max exit latency stay.
+                0xff05_0000,
+                // Only the TT Think Time, not the TT hub slot, port or interrupter target.
+                0x0003_0000,
+            ]
+        );
+    }
+
+    #[test]
+    fn evaluate_context_takes_the_latency_and_the_interrupter_target() {
+        let ram = ram_with_slot_contexts([u32::MAX; 3], [0x0400_0041, 0x0405_0000, 0x0000_0102]);
+        let bus: BusDeviceRef = ram.clone();
+
+        update_context_dwords(
+            &bus,
+            INPUT_SLOT_CONTEXT,
+            OUTPUT_SLOT_CONTEXT,
+            EVALUATE_CONTEXT_SLOT_FIELDS,
+        );
+
+        assert_eq!(output_dwords(&ram), [0x0400_0041, 0x0405_ffff, 0xffc0_0102]);
     }
 }
 

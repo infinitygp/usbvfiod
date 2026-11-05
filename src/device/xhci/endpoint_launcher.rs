@@ -40,6 +40,8 @@ pub struct LaunchRequest {
     pub slot_id: u8,
     pub endpoint_id: u8,
     pub root_hub_port: u8,
+    /// The hub ports from the root hub to the device, as in the slot context.
+    pub route_string: u32,
     pub endpoint_context: EndpointContext,
     pub responder: oneshot::Sender<EndpointSender>,
 }
@@ -63,6 +65,7 @@ impl LaunchRequester {
         slot_id: u8,
         endpoint_id: u8,
         root_hub_port: u8,
+        route_string: u32,
         endpoint_context: EndpointContext,
     ) -> anyhow::Result<EndpointSender> {
         let (send, recv) = oneshot::channel();
@@ -70,6 +73,7 @@ impl LaunchRequester {
             slot_id,
             endpoint_id,
             root_hub_port,
+            route_string,
             endpoint_context,
             responder: send,
         };
@@ -114,13 +118,13 @@ impl<CRD: CompleteRealDevice> EndpointLauncher<CRD> {
         loop {
             let request = self.next_msg().await?;
             debug!(
-                "endpoint launch request for slot {} endpoint {} with device at root hub port {}",
-                request.slot_id, request.endpoint_id, request.root_hub_port
+                "endpoint launch request for slot {} endpoint {} with device at root hub port {} and route string {:#07x}",
+                request.slot_id, request.endpoint_id, request.root_hub_port, request.route_string
             );
 
             let device = self
                 .device_retriever
-                .get_device(request.root_hub_port)
+                .get_device(request.root_hub_port, request.route_string)
                 .await?;
             let endpoint_type = request.endpoint_context.get_endpoint_type();
             debug!("endpoint context specifies endpoint type {endpoint_type:?}");
@@ -289,5 +293,179 @@ impl<CRD: CompleteRealDevice> EndpointLauncher<CRD> {
             hotplug_endpoint_handle,
             launch_args.endpoint_context,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use tokio::runtime::Handle;
+    use usbvfiod::hotplug_protocol::response::Response;
+
+    use super::*;
+    use crate::{
+        device::{
+            bus::{testutils::TestBusDevice, BusDevice, Request, RequestSize},
+            xhci::{
+                hub_ports::{HubHandle, HubShared},
+                interrupter::tests::testutils::MockInterrupter,
+                port::PortArray,
+                real_device::{
+                    tests::testutils::MockRealDeviceWithSpeed, CompleteRealDeviceImpl, Speed,
+                },
+            },
+        },
+        dynamic_bus::DynamicBus,
+    };
+
+    /// A device that counts how often the controller asks it for its control endpoint, which is
+    /// what a launched control endpoint does.
+    #[derive(Debug)]
+    struct CountingDevice {
+        speed: Speed,
+        control_endpoints: Arc<AtomicUsize>,
+    }
+
+    type Mock = MockRealDeviceWithSpeed;
+
+    impl RealDevice for CountingDevice {
+        type RCEH = <Mock as RealDevice>::RCEH;
+        type RBIEH = <Mock as RealDevice>::RBIEH;
+        type RBOEH = <Mock as RealDevice>::RBOEH;
+        type RIIEH = <Mock as RealDevice>::RIIEH;
+        type RIOEH = <Mock as RealDevice>::RIOEH;
+
+        fn speed(&self) -> Option<Speed> {
+            Some(self.speed)
+        }
+
+        fn control_endpoint_handle(&self) -> Self::RCEH {
+            self.control_endpoints.fetch_add(1, Ordering::SeqCst);
+            Mock::from(self.speed).control_endpoint_handle()
+        }
+
+        fn bulk_in_endpoint_handle(&self, endpoint_id: u8) -> Self::RBIEH {
+            Mock::from(self.speed).bulk_in_endpoint_handle(endpoint_id)
+        }
+
+        fn bulk_out_endpoint_handle(&self, endpoint_id: u8) -> Self::RBOEH {
+            Mock::from(self.speed).bulk_out_endpoint_handle(endpoint_id)
+        }
+
+        fn interrupt_in_endpoint_handle(&self, endpoint_id: u8) -> Self::RIIEH {
+            Mock::from(self.speed).interrupt_in_endpoint_handle(endpoint_id)
+        }
+
+        fn interrupt_out_endpoint_handle(&self, endpoint_id: u8) -> Self::RIOEH {
+            Mock::from(self.speed).interrupt_out_endpoint_handle(endpoint_id)
+        }
+    }
+
+    type Device = CompleteRealDeviceImpl<CountingDevice, (u8, u8)>;
+
+    const CONTEXT: u64 = 0x100;
+    /// EP Type 4: control.
+    const CONTROL_ENDPOINT_TYPE: u64 = 4 << 3;
+
+    fn device(id: u8, speed: Speed) -> (Device, Arc<AtomicUsize>) {
+        let control_endpoints = Arc::new(AtomicUsize::new(0));
+        let device = CompleteRealDeviceImpl::new(
+            (id, id),
+            CountingDevice {
+                speed,
+                control_endpoints: control_endpoints.clone(),
+            },
+        );
+        (device, control_endpoints)
+    }
+
+    fn hub(id: u8) -> (Device, Arc<AtomicUsize>) {
+        let (device, counter) = device(id, Speed::High);
+        let shared = Arc::new(HubShared::new(4, Speed::High));
+        (device.with_hub(HubHandle::new(shared)), counter)
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_launches_on_the_device_that_the_route_string_names() {
+        let (event_sender, _interrupter) = MockInterrupter::new();
+        let port_array: PortArray<Device> = PortArray::new(event_sender.clone(), Handle::current());
+        let control = port_array.create_hotplug_control();
+        let dma_bus = Arc::new(DynamicBus::new());
+        dma_bus
+            .add(0, Arc::new(TestBusDevice::new(&[0u8; 0x1000])))
+            .unwrap();
+        dma_bus.write(
+            Request::new(CONTEXT + 4, RequestSize::Size1),
+            CONTROL_ENDPOINT_TYPE,
+        );
+        let launcher = EndpointLauncher::start(
+            port_array.create_device_retriever(),
+            Handle::current(),
+            dma_bus.clone(),
+            event_sender,
+        );
+
+        // Two hubs in a row, with a device on the second and one on the first, and a device on
+        // another root port.
+        let mut counters = Vec::new();
+        for (path, (device, counter)) in [
+            ("5", hub(1)),
+            ("5.1", hub(2)),
+            ("5.1.4", device(3, Speed::Full)),
+            ("5.2", device(4, Speed::Full)),
+            ("6", device(5, Speed::Full)),
+        ] {
+            assert_eq!(
+                control.attach_at(path.parse().unwrap(), device).await,
+                Response::SuccessfulOperation
+            );
+            counters.push(counter);
+        }
+        let launches = || {
+            counters
+                .iter()
+                .map(|counter| counter.load(Ordering::SeqCst))
+                .collect::<Vec<_>>()
+        };
+        let launch = async |root_port, route_string| {
+            launcher
+                .request_launch(
+                    1,
+                    1,
+                    root_port,
+                    route_string,
+                    EndpointContext::new(CONTEXT, dma_bus.clone()),
+                )
+                .await
+                .unwrap()
+                .terminate()
+                .await
+                .unwrap();
+        };
+
+        launch(5, 0).await;
+        assert_eq!(launches(), [1, 0, 0, 0, 0], "the hub on the root port");
+        launch(5, 0x1).await;
+        assert_eq!(launches(), [1, 1, 0, 0, 0], "the hub on its first port");
+        launch(5, 0x41).await;
+        assert_eq!(launches(), [1, 1, 1, 0, 0], "port 4 of that hub");
+        launch(5, 0x2).await;
+        assert_eq!(launches(), [1, 1, 1, 1, 0], "port 2 of the first hub");
+        launch(6, 0).await;
+        assert_eq!(
+            launches(),
+            [1, 1, 1, 1, 1],
+            "the device on another root port"
+        );
+
+        // No device is there: the endpoint gets a dummy handle, and no device is asked.
+        launch(5, 0x3).await;
+        launch(5, 0x42).await;
+        launch(7, 0).await;
+        assert_eq!(launches(), [1, 1, 1, 1, 1]);
     }
 }

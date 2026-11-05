@@ -1,11 +1,13 @@
 pub mod any_device;
 pub mod command_ring;
 pub mod controller_reset;
+pub mod device_tree;
 pub mod endpoint;
 pub mod endpoint_handle;
 pub mod endpoint_launcher;
 pub mod event_ring;
 pub mod hotplug_endpoint_handle;
+pub mod hub_ports;
 pub mod interrupter;
 pub mod linked_ring;
 pub mod nusb;
@@ -14,7 +16,8 @@ pub mod real_device;
 pub mod real_endpoint_handle;
 pub mod registers;
 pub mod slot_manager;
+pub mod stalling_endpoint;
 pub mod trb;
 pub mod usbrequest;
-#[cfg(test)]
 pub mod virtual_hid;
+pub mod virtual_hub;

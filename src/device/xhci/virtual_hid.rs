@@ -1,22 +1,23 @@
 //! A minimal virtual HID device for checking the controller with a real guest.
 //!
-//! The device is only compiled for tests. The ignored test `serve_a_virtual_hid_to_a_guest` in
-//! `xhci_backend` serves it to a guest without any hardware: it enumerates like a USB input
-//! device with a vendor defined report, and sends a report every few hundred milliseconds so that
-//! the guest sees transfer events all the time.
+//! It enumerates like a USB input device with a vendor defined report, and sends a report every
+//! few hundred milliseconds so that the guest sees transfer events all the time. The hotplug
+//! command `--virtual-hid` attaches it at a port path, at full speed or at high speed, and the
+//! ignored test `serve_a_virtual_hid_to_a_guest` in `xhci_backend` serves it to a guest without any
+//! hardware or hotplug socket.
 
 use std::{future::Future, pin::Pin, time::Duration};
 
 use tokio::time::sleep;
 
 use crate::device::xhci::{
-    endpoint_handle::tests::testutils::{MockRealInEndpoint, MockRealOutEndpoint},
     hotplug_endpoint_handle::BaseEndpointHandle,
     real_device::{RealDevice, Speed},
     real_endpoint_handle::{
         ControlRequestProcessingResult, InTrbProcessingResult, InTrbProcessingStatus,
         RealControlEndpointHandle, RealInEndpointHandle,
     },
+    stalling_endpoint::{StallingInEndpoint, StallingOutEndpoint},
     usbrequest::UsbRequest,
 };
 
@@ -36,9 +37,11 @@ const REPORT_DESCRIPTOR: [u8; 21] = [
     0xc0, // End Collection
 ];
 
+/// The descriptors are those of a full speed only device. At high speed the device is a USB 2.0
+/// device with the same descriptors, and a shorter interval of the interrupt endpoint.
 const DEVICE_DESCRIPTOR: [u8; 18] = [
     18, 1, // bLength, bDescriptorType
-    0x10, 0x01, // bcdUSB 1.10, a full speed only device
+    0x10, 0x01, // bcdUSB 1.10
     0, 0, 0,  // class, subclass, protocol: defined by the interface
     64, // bMaxPacketSize0
     0x09, 0x12, // idVendor 0x1209
@@ -99,31 +102,48 @@ fn string_descriptor(index: u8) -> Option<Vec<u8>> {
     Some(descriptor)
 }
 
-/// A full speed HID device with a vendor defined input report.
-#[derive(Debug, Default)]
-pub struct VirtualHid;
+/// A HID device with a vendor defined input report, at full speed or at high speed.
+#[derive(Debug)]
+pub struct VirtualHid {
+    speed: Speed,
+}
+
+impl VirtualHid {
+    pub const fn new(speed: Speed) -> Self {
+        Self { speed }
+    }
+}
+
+impl Default for VirtualHid {
+    fn default() -> Self {
+        Self::new(Speed::Full)
+    }
+}
 
 impl RealDevice for VirtualHid {
     type RCEH = VirtualHidControlEndpoint;
-    type RBIEH = MockRealInEndpoint;
-    type RBOEH = MockRealOutEndpoint;
+    type RBIEH = StallingInEndpoint;
+    type RBOEH = StallingOutEndpoint;
     type RIIEH = VirtualHidInterruptEndpoint;
-    type RIOEH = MockRealOutEndpoint;
+    type RIOEH = StallingOutEndpoint;
 
     fn speed(&self) -> Option<Speed> {
-        Some(Speed::Full)
+        Some(self.speed)
     }
 
     fn control_endpoint_handle(&self) -> Self::RCEH {
-        VirtualHidControlEndpoint { response: None }
+        VirtualHidControlEndpoint {
+            speed: self.speed,
+            response: None,
+        }
     }
 
     fn bulk_in_endpoint_handle(&self, _endpoint_id: u8) -> Self::RBIEH {
-        MockRealInEndpoint::new(None)
+        StallingInEndpoint
     }
 
     fn bulk_out_endpoint_handle(&self, _endpoint_id: u8) -> Self::RBOEH {
-        MockRealOutEndpoint::new()
+        StallingOutEndpoint
     }
 
     fn interrupt_in_endpoint_handle(&self, _endpoint_id: u8) -> Self::RIIEH {
@@ -134,17 +154,55 @@ impl RealDevice for VirtualHid {
     }
 
     fn interrupt_out_endpoint_handle(&self, _endpoint_id: u8) -> Self::RIOEH {
-        MockRealOutEndpoint::new()
+        StallingOutEndpoint
     }
 }
 
 #[derive(Debug)]
 pub struct VirtualHidControlEndpoint {
+    speed: Speed,
     response: Option<ControlRequestProcessingResult>,
 }
 
 impl VirtualHidControlEndpoint {
-    fn answer(request: &UsbRequest) -> ControlRequestProcessingResult {
+    /// The device descriptor, which tells a high speed device from a full speed one by its USB
+    /// version.
+    fn device_descriptor(speed: Speed) -> Vec<u8> {
+        let mut descriptor = DEVICE_DESCRIPTOR.to_vec();
+        if speed == Speed::High {
+            descriptor[2..4].copy_from_slice(&[0x00, 0x02]);
+        }
+        descriptor
+    }
+
+    /// The configuration descriptor, with the polling interval of the endpoint for the speed:
+    /// 10 frames of 1 ms at full speed, and 8 ms (an exponent of 7) at high speed.
+    fn configuration_descriptor(speed: Speed) -> Vec<u8> {
+        let mut descriptor = CONFIGURATION_DESCRIPTOR.to_vec();
+        if speed == Speed::High {
+            *descriptor.last_mut().expect("the descriptor is not empty") = 7;
+        }
+        descriptor
+    }
+
+    /// The device qualifier and the configuration for the other speed, which a high speed device
+    /// has and a full speed one does not.
+    fn other_speed_descriptor(speed: Speed, descriptor_type: u8) -> Option<Vec<u8>> {
+        if speed != Speed::High {
+            return None;
+        }
+        match descriptor_type {
+            6 => Some(vec![10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0]),
+            7 => {
+                let mut descriptor = CONFIGURATION_DESCRIPTOR.to_vec();
+                descriptor[1] = 7;
+                Some(descriptor)
+            }
+            _ => None,
+        }
+    }
+
+    fn answer(speed: Speed, request: &UsbRequest) -> ControlRequestProcessingResult {
         const GET_STATUS: u8 = 0;
         const GET_DESCRIPTOR: u8 = 6;
         const SET_CONFIGURATION: u8 = 9;
@@ -157,10 +215,10 @@ impl VirtualHidControlEndpoint {
 
         let data = match (request.request_type, request.request) {
             (0x80, GET_DESCRIPTOR) => match descriptor_type {
-                1 => Some(DEVICE_DESCRIPTOR.to_vec()),
-                2 => Some(CONFIGURATION_DESCRIPTOR.to_vec()),
+                1 => Some(Self::device_descriptor(speed)),
+                2 => Some(Self::configuration_descriptor(speed)),
                 3 => string_descriptor(descriptor_index),
-                _ => None,
+                other => Self::other_speed_descriptor(speed, other),
             },
             (0x81, GET_DESCRIPTOR) if descriptor_type == 0x22 => Some(REPORT_DESCRIPTOR.to_vec()),
             (0x80 | 0x81, GET_STATUS) => Some(vec![0, 0]),
@@ -182,7 +240,7 @@ impl RealControlEndpointHandle for VirtualHidControlEndpoint {
         Pin<Box<dyn Future<Output = anyhow::Result<ControlRequestProcessingResult>> + Send + 'a>>;
 
     fn submit_control_request(&mut self, request: UsbRequest) -> anyhow::Result<()> {
-        self.response = Some(Self::answer(&request));
+        self.response = Some(Self::answer(self.speed, &request));
         Ok(())
     }
 
@@ -244,19 +302,32 @@ impl BaseEndpointHandle for VirtualHidInterruptEndpoint {
 mod tests {
     use super::*;
 
+    fn control_at(
+        speed: Speed,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        length: u32,
+    ) -> ControlRequestProcessingResult {
+        VirtualHidControlEndpoint::answer(
+            speed,
+            &UsbRequest {
+                request_type,
+                request,
+                value,
+                length,
+                ..Default::default()
+            },
+        )
+    }
+
     fn control(
         request_type: u8,
         request: u8,
         value: u16,
         length: u32,
     ) -> ControlRequestProcessingResult {
-        VirtualHidControlEndpoint::answer(&UsbRequest {
-            request_type,
-            request,
-            value,
-            length,
-            ..Default::default()
-        })
+        control_at(Speed::Full, request_type, request, value, length)
     }
 
     fn data_of(result: ControlRequestProcessingResult) -> Vec<u8> {
@@ -285,6 +356,38 @@ mod tests {
         let product = data_of(control(0x80, 6, 0x0302, 255));
         assert_eq!(usize::from(product[0]), product.len());
         assert_eq!(data_of(control(0x80, 6, 0x0300, 255)), [4, 3, 9, 4]);
+    }
+
+    #[test]
+    fn a_high_speed_device_is_a_usb_2_device_with_other_speed_descriptors() {
+        let device = data_of(control_at(Speed::High, 0x80, 6, 0x0100, 64));
+        assert_eq!(device[2..4], [0x00, 0x02], "bcdUSB 2.00");
+        assert_eq!(device[4..], DEVICE_DESCRIPTOR[4..]);
+
+        let configuration = data_of(control_at(Speed::High, 0x80, 6, 0x0200, 255));
+        assert_eq!(configuration[..33], CONFIGURATION_DESCRIPTOR[..33]);
+        assert_eq!(configuration[33], 7, "the interval is an exponent");
+
+        assert_eq!(
+            data_of(control_at(Speed::High, 0x80, 6, 0x0600, 255)),
+            [10, 6, 0x00, 0x02, 0, 0, 0, 64, 1, 0]
+        );
+        let other_speed = data_of(control_at(Speed::High, 0x80, 6, 0x0700, 255));
+        assert_eq!(other_speed[1], 7);
+        assert_eq!(other_speed[2..], CONFIGURATION_DESCRIPTOR[2..]);
+    }
+
+    #[test]
+    fn a_full_speed_device_does_not_know_about_other_speeds() {
+        assert!(matches!(
+            control(0x80, 6, 0x0600, 255),
+            ControlRequestProcessingResult::Stall
+        ));
+        assert!(matches!(
+            control(0x80, 6, 0x0700, 255),
+            ControlRequestProcessingResult::Stall
+        ));
+        assert_eq!(data_of(control(0x80, 6, 0x0100, 64))[2..4], [0x10, 0x01]);
     }
 
     #[test]
