@@ -32,6 +32,11 @@ that the next QEMU can attach to the same socket:
 $ usbvfiod --socket-path /path/usbvfiod.sock --hotplug-socket-path /path/usb-hotplug.sock --reconnect
 ```
 
+When usbvfiod ends, because the client went away without `--reconnect` or on SIGINT or SIGTERM, it
+detaches every device and gives the host devices back to their kernel drivers before it exits (it
+waits up to 3 s for that). A usbvfiod that is killed with SIGKILL or crashes leaves them without a
+driver until something binds them again (`USBDEVFS_CONNECT`, or unplugging the device).
+
 Add the controller on the command line:
 
 ```console
