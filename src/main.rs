@@ -21,7 +21,7 @@ use clap::Parser;
 use cli::Cli;
 use device::pcap::UsbPcapManager;
 use hotplug_server::run_hotplug_server;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 use vfio_user::Server;
 
@@ -82,9 +82,21 @@ fn main() -> Result<()> {
 
     info!("We're up!");
 
-    server
-        .run(&mut backend)
-        .context("Failed to start vfio-user server")?;
+    loop {
+        let result = server.run(&mut backend);
+
+        if !args.reconnect {
+            result.context("Failed to start vfio-user server")?;
+            break;
+        }
+
+        match result {
+            Ok(()) => info!("The vfio-user client disconnected"),
+            Err(err) => warn!("The vfio-user connection failed: {err}"),
+        }
+        backend.disconnect();
+        info!("Waiting for the next vfio-user client");
+    }
 
     if let Some(hotplug_socket_path) = args.hotplug_socket_path {
         if hotplug_socket_path.exists() {

@@ -61,6 +61,13 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub pcap_path: Option<PathBuf>,
 
+    /// Keep running when the vfio-user client disconnects and serve the next one.
+    ///
+    /// The controller is reset and the guest memory forgotten in between. Devices stay attached.
+    /// Without this option, usbvfiod exits when the client disconnects.
+    #[arg(long)]
+    pub reconnect: bool,
+
     /// Do not use ANSI color codes in the output.
     #[arg(long)]
     pub no_color: bool,
