@@ -228,6 +228,27 @@ const CONFIG_REGION_SIZE: u64 = config_space::SIZE as u64;
 /// The widest access we hand to the controller.
 const MAX_ACCESS_SIZE: usize = 4;
 
+/// Split an access into pieces of 4, 2 or 1 byte, which is what the controller can serve.
+///
+/// The registers of the xHC are 32 bits wide, and 64-bit registers consist of two of them.
+/// Splitting an 8-byte access is what the specification allows for a controller without 64-bit
+/// addressing.
+fn split_access(offset: u64, len: usize) -> impl Iterator<Item = (u64, usize, usize)> {
+    let mut done = 0;
+    std::iter::from_fn(move || {
+        let remaining = len - done;
+        let size = match remaining {
+            0 => return None,
+            1 => 1,
+            2 | 3 => 2,
+            _ => MAX_ACCESS_SIZE,
+        };
+        let chunk = (offset.wrapping_add(done as u64), done, size);
+        done += size;
+        Some(chunk)
+    })
+}
+
 impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
     /// Read from a region, splitting what the controller cannot serve in one piece.
     ///
@@ -255,15 +276,12 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
         // The registers of the xHC are 32 bits wide, and 64-bit registers consist of two of them.
         // Splitting an 8-byte access is what the specification allows for a controller without
         // 64-bit addressing.
-        for (index, chunk) in data.chunks_mut(MAX_ACCESS_SIZE).enumerate() {
-            let Ok(size) = RequestSize::try_from(chunk.len()) else {
-                debug!(
-                    "read of region {region} with unsupported size {}",
-                    chunk.len()
-                );
+        for (chunk_offset, start, len) in split_access(offset, data.len()) {
+            let chunk = &mut data[start..start + len];
+            let Ok(size) = RequestSize::try_from(len) else {
                 return;
             };
-            let req = Request::new(offset + (index * MAX_ACCESS_SIZE) as u64, size);
+            let req = Request::new(chunk_offset, size);
             let value = match region {
                 VFIO_PCI_CONFIG_REGION_INDEX => self.controller.read_cfg(req),
                 _ => self.controller.read_io(0, req),
@@ -286,15 +304,12 @@ impl<CRD: CompleteRealDevice> XhciBackend<CRD> {
             return;
         }
 
-        for (index, chunk) in data.chunks(MAX_ACCESS_SIZE).enumerate() {
-            let Ok(size) = RequestSize::try_from(chunk.len()) else {
-                debug!(
-                    "write to region {region} with unsupported size {}",
-                    chunk.len()
-                );
+        for (chunk_offset, start, len) in split_access(offset, data.len()) {
+            let chunk = &data[start..start + len];
+            let Ok(size) = RequestSize::try_from(len) else {
                 return;
             };
-            let req = Request::new(offset + (index * MAX_ACCESS_SIZE) as u64, size);
+            let req = Request::new(chunk_offset, size);
             let mut value = [0u8; 8];
             value[0..chunk.len()].copy_from_slice(chunk);
             let value = u64::from_le_bytes(value);
@@ -481,5 +496,388 @@ impl<CRD: CompleteRealDevice> ServerBackend for XhciBackend<CRD> {
         self.controller.connect_irq(irq);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{ffi::CString, os::fd::FromRawFd};
+
+    use vfio_bindings::bindings::vfio::{VFIO_IRQ_SET_DATA_NONE, VFIO_PCI_INTX_IRQ_INDEX};
+    use vfio_user::{DmaMapFlags, DmaUnmapFlags};
+
+    use crate::device::{
+        bus::BusDevice,
+        pci::constants::xhci::{capability, offset},
+        xhci::real_device::{tests::testutils::MockRealDevice, CompleteRealDeviceImpl},
+    };
+
+    use super::*;
+
+    type TestBackend = XhciBackend<CompleteRealDeviceImpl<MockRealDevice, (u8, u8)>>;
+
+    fn backend() -> TestBackend {
+        TestBackend::new(runtime::Handle::current()).unwrap()
+    }
+
+    fn memfd(size: u64, fill: impl Fn(u64) -> u8) -> File {
+        // SAFETY: syscall with valid parameters.
+        let fd = unsafe { libc::memfd_create(CString::new("unittest").unwrap().as_ptr(), 0) };
+        assert!(fd >= 0);
+        // SAFETY: fd is a valid file descriptor, because we created it above.
+        let file = unsafe { File::from_raw_fd(fd) };
+        file.set_len(size).unwrap();
+        let content: Vec<u8> = (0..size).map(fill).collect();
+        std::os::unix::fs::FileExt::write_all_at(&file, &content, 0).unwrap();
+        file
+    }
+
+    fn dma_read(backend: &TestBackend, address: u64) -> u64 {
+        backend
+            .dma_bus
+            .read(Request::new(address, RequestSize::Size1))
+    }
+
+    fn read_region(backend: &mut TestBackend, region: u32, offset: u64, len: usize) -> Vec<u8> {
+        let mut data = vec![0; len];
+        backend.region_read(region, offset, &mut data).unwrap();
+        data
+    }
+
+    #[tokio::test]
+    async fn dma_mapping_with_file_descriptor_is_accessible_at_its_address() {
+        let mut backend = backend();
+        let file = memfd(0x4000, |offset| (offset / 0x1000) as u8 + 1);
+
+        // Map the second and third page of the file.
+        backend
+            .dma_map(
+                DmaMapFlags::READ_WRITE,
+                0x1000,
+                0x8000_0000,
+                0x2000,
+                Some(file),
+            )
+            .unwrap();
+
+        assert_eq!(dma_read(&backend, 0x8000_0000), 2);
+        assert_eq!(dma_read(&backend, 0x8000_1fff), 3);
+        assert_eq!(dma_read(&backend, 0x8000_2000), 0xff);
+    }
+
+    #[tokio::test]
+    async fn dma_mapping_without_file_descriptor_is_tracked_and_fails_accesses_softly() {
+        let mut backend = backend();
+
+        backend
+            .dma_map(DmaMapFlags::READ_WRITE, 0, 0xa0000, 0x10000, None)
+            .unwrap();
+
+        // Reads behave like an access that nobody answers, and writes do not panic.
+        assert_eq!(dma_read(&backend, 0xa0000), 0xff);
+        backend
+            .dma_bus
+            .write(Request::new(0xa0010, RequestSize::Size4), 0x1234);
+        let mut data = [0u8; 8];
+        backend.dma_bus.read_bulk(0xa0100, &mut data);
+        assert_eq!(data, [0xff; 8]);
+
+        // The range is taken: the client cannot map something else there.
+        assert!(backend
+            .dma_map(DmaMapFlags::READ_WRITE, 0, 0xa8000, 0x1000, None)
+            .is_err());
+
+        backend
+            .dma_unmap(DmaUnmapFlags::empty(), 0xa0000, 0x10000)
+            .unwrap();
+        backend
+            .dma_map(DmaMapFlags::READ_WRITE, 0, 0xa8000, 0x1000, None)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn dma_unmap_of_a_part_keeps_the_rest_of_the_mapping() {
+        let mut backend = backend();
+        backend
+            .dma_map(
+                DmaMapFlags::READ_WRITE,
+                0,
+                0x10000,
+                0x4000,
+                Some(memfd(0x4000, |offset| (offset / 0x1000) as u8 + 1)),
+            )
+            .unwrap();
+
+        // The client removes the middle, like it does when it changes its memory map.
+        backend
+            .dma_unmap(DmaUnmapFlags::empty(), 0x11000, 0x2000)
+            .unwrap();
+        assert_eq!(dma_read(&backend, 0x10fff), 1);
+        assert_eq!(dma_read(&backend, 0x11000), 0xff);
+        assert_eq!(dma_read(&backend, 0x12fff), 0xff);
+        assert_eq!(dma_read(&backend, 0x13000), 4);
+
+        // The hole can be filled again.
+        backend
+            .dma_map(
+                DmaMapFlags::READ_WRITE,
+                0,
+                0x11000,
+                0x2000,
+                Some(memfd(0x2000, |_| 0x77)),
+            )
+            .unwrap();
+        assert_eq!(dma_read(&backend, 0x11000), 0x77);
+
+        // An unmap that spans several mappings and goes beyond them.
+        backend
+            .dma_unmap(DmaUnmapFlags::empty(), 0, 0x100000)
+            .unwrap();
+        assert_eq!(dma_read(&backend, 0x10000), 0xff);
+        assert_eq!(dma_read(&backend, 0x13000), 0xff);
+    }
+
+    #[tokio::test]
+    async fn dma_unmap_all_forgets_every_mapping() {
+        let mut backend = backend();
+        for address in [0x1000, 0x5000] {
+            backend
+                .dma_map(
+                    DmaMapFlags::READ_WRITE,
+                    0,
+                    address,
+                    0x1000,
+                    Some(memfd(0x1000, |_| 1)),
+                )
+                .unwrap();
+        }
+
+        backend.dma_unmap(DmaUnmapFlags::UNMAP_ALL, 0, 0).unwrap();
+
+        assert_eq!(dma_read(&backend, 0x1000), 0xff);
+        assert_eq!(dma_read(&backend, 0x5000), 0xff);
+        backend
+            .dma_unmap(DmaUnmapFlags::empty(), 0x1000, 0x1000)
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_access_covers_every_size_with_valid_pieces() {
+        let pieces: Vec<_> = split_access(0x10, 7).collect();
+        assert_eq!(pieces, [(0x10, 0, 4), (0x14, 4, 2), (0x16, 6, 1)]);
+        assert_eq!(split_access(0, 8).count(), 2);
+        assert_eq!(split_access(0, 0).count(), 0);
+    }
+
+    #[tokio::test]
+    async fn config_space_identifies_an_xhci_controller() {
+        let mut backend = backend();
+
+        let ids = read_region(&mut backend, VFIO_PCI_CONFIG_REGION_INDEX, 0, 4);
+        assert_eq!(ids, [0x36, 0x1b, 0x0d, 0x00]);
+        let class = read_region(&mut backend, VFIO_PCI_CONFIG_REGION_INDEX, 9, 3);
+        assert_eq!(class, [0x30, 0x03, 0x0c]);
+    }
+
+    #[tokio::test]
+    async fn accesses_beyond_a_region_or_to_unknown_regions_do_not_panic() {
+        let mut backend = backend();
+
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_CONFIG_REGION_INDEX, 254, 4),
+            [0xff; 4]
+        );
+        assert_eq!(read_region(&mut backend, 6, 0, 4), [0xff; 4]);
+        assert_eq!(read_region(&mut backend, 42, 0, 4), [0xff; 4]);
+        assert_eq!(read_region(&mut backend, 0, u64::MAX - 1, 4), [0xff; 4]);
+        assert_eq!(read_region(&mut backend, 0, 0, 0), Vec::<u8>::new());
+
+        backend
+            .region_write(VFIO_PCI_CONFIG_REGION_INDEX, 255, &[1, 2, 3, 4])
+            .unwrap();
+        backend.region_write(42, 0, &[1, 2, 3, 4]).unwrap();
+        backend.region_write(0, 1 << 40, &[1, 2, 3, 4]).unwrap();
+        backend.region_write(0, 0, &[1, 2, 3]).unwrap();
+        backend.region_write(0, 0x3ffc, &[0; 4]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_pending_bit_array_of_msix_reads_as_zero() {
+        let mut backend = backend();
+
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_BAR3_REGION_INDEX, 0x1000, 8),
+            [0; 8]
+        );
+    }
+
+    #[tokio::test]
+    async fn eight_byte_accesses_to_the_mmio_region_reach_both_halves_of_a_register() {
+        let mut backend = backend();
+
+        // CAPLENGTH/HCIVERSION and HCSPARAMS1 in one access.
+        let data = read_region(
+            &mut backend,
+            VFIO_PCI_BAR0_REGION_INDEX,
+            offset::CAPLENGTH,
+            8,
+        );
+        let caplength_hciversion = u32::from_le_bytes(data[0..4].try_into().unwrap());
+        let hcsparams1 = u32::from_le_bytes(data[4..8].try_into().unwrap());
+        assert_eq!(caplength_hciversion & 0xff, 0x40);
+        assert_eq!(
+            u64::from(caplength_hciversion >> 16),
+            capability::HCIVERSION
+        );
+        assert_eq!(u64::from(hcsparams1), capability::HCSPARAMS1);
+
+        // A 64-bit register, written as a whole.
+        backend
+            .region_write(
+                VFIO_PCI_BAR0_REGION_INDEX,
+                offset::DCBAAP,
+                &0x1234_5000u64.to_le_bytes(),
+            )
+            .unwrap();
+        let data = read_region(&mut backend, VFIO_PCI_BAR0_REGION_INDEX, offset::DCBAAP, 8);
+        assert_eq!(u64::from_le_bytes(data.try_into().unwrap()), 0x1234_5000);
+    }
+
+    #[tokio::test]
+    async fn registers_that_do_not_exist_read_as_zero_and_ignore_writes() {
+        let mut backend = backend();
+
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_BAR0_REGION_INDEX, 0x1000, 4),
+            [0; 4]
+        );
+        backend
+            .region_write(VFIO_PCI_BAR0_REGION_INDEX, 0x1000, &[1, 2, 3, 4])
+            .unwrap();
+        // The upper half of an address register is not backed either.
+        backend
+            .region_write(VFIO_PCI_BAR0_REGION_INDEX, offset::CRCR_HI, &[1, 0, 0, 0])
+            .unwrap();
+        // DNCTL only has defined values.
+        backend
+            .region_write(VFIO_PCI_BAR0_REGION_INDEX, offset::DNCTL, &[0xff; 4])
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn interrupt_requests_of_the_client_never_panic() {
+        let mut backend = backend();
+
+        // Switch off everything, like a client does when it resets the device.
+        for index in 0..VFIO_PCI_NUM_IRQS {
+            backend
+                .set_irqs(
+                    index,
+                    VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+                    0,
+                    0,
+                    vec![],
+                )
+                .unwrap();
+        }
+        // More vectors than we have, and a vector that does not exist.
+        backend
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                0,
+                4,
+                vec![memfd(8, |_| 0), memfd(8, |_| 0)],
+            )
+            .unwrap();
+        backend
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_EVENTFD | VFIO_IRQ_SET_ACTION_TRIGGER,
+                7,
+                1,
+                vec![memfd(8, |_| 0)],
+            )
+            .unwrap();
+        // Interrupt types we do not offer, masking and triggering by the client.
+        backend
+            .set_irqs(
+                VFIO_PCI_INTX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+                0,
+                1,
+                vec![],
+            )
+            .unwrap();
+        backend
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_NONE,
+                0,
+                1,
+                vec![],
+            )
+            .unwrap();
+        backend
+            .set_irqs(
+                VFIO_PCI_MSIX_IRQ_INDEX,
+                VFIO_IRQ_SET_DATA_NONE | VFIO_IRQ_SET_ACTION_TRIGGER,
+                0,
+                1,
+                vec![],
+            )
+            .unwrap();
+    }
+
+    // The reset waits for the workers of the controller, so they need threads of their own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn device_reset_restores_the_initial_state() {
+        let mut backend = backend();
+        backend
+            .dma_map(
+                DmaMapFlags::READ_WRITE,
+                0,
+                0x1000,
+                0x1000,
+                Some(memfd(0x1000, |_| 9)),
+            )
+            .unwrap();
+
+        // The client programs the first BAR and the driver the DCBAAP.
+        backend
+            .region_write(
+                VFIO_PCI_CONFIG_REGION_INDEX,
+                0x10,
+                &0xfe00_0000u32.to_le_bytes(),
+            )
+            .unwrap();
+        backend
+            .region_write(
+                VFIO_PCI_BAR0_REGION_INDEX,
+                offset::DCBAAP,
+                &0x1000u32.to_le_bytes(),
+            )
+            .unwrap();
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_CONFIG_REGION_INDEX, 0x10, 4),
+            0xfe00_0000u32.to_le_bytes()
+        );
+
+        backend.reset().unwrap();
+
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_CONFIG_REGION_INDEX, 0x10, 4),
+            [0; 4]
+        );
+        assert_eq!(
+            read_region(&mut backend, VFIO_PCI_BAR0_REGION_INDEX, offset::DCBAAP, 4),
+            [0; 4]
+        );
+        // The memory of the client is not forgotten by a reset of the device.
+        assert_eq!(dma_read(&backend, 0x1000), 9);
+
+        // Losing the connection is different.
+        backend.disconnect();
+        assert_eq!(dma_read(&backend, 0x1000), 0xff);
     }
 }
