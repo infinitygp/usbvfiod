@@ -18,6 +18,10 @@ and maintain [a `NixOS`
 package](https://search.nixos.org/packages?channel=unstable&query=usbvfiod).
 
 > [!NOTE]
+> These are the packages of upstream. This fork is not on crates.io or in nixpkgs: its releases
+> and how to build it from source are in the [README](../../README.md).
+
+> [!NOTE]
 > There are currently no other officially maintained distribution packages
 > available.
 
