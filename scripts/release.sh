@@ -13,6 +13,8 @@ remote=https://github.com/infinitygp/usbvfiod.git
 target=x86_64-unknown-linux-musl
 out=$HOME/.cache/usbvfiod-release
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$out/target}
+# Panic messages carry the source paths of the crates; the home directory of the builder stays out.
+export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~"
 git() { command git -c credential.helper= -c 'credential.helper=!gh auth git-credential' "$@"; }
 log() { printf '%s release: %s\n' "$(date +%T)" "$*" >&2; }
 fail() { log "error: $*"; exit 1; }
@@ -36,9 +38,11 @@ cargo test -q
 
 log "static binary ($target)"
 rustup target list --installed | grep -qx "$target" || fail "rustup target add $target"
+command -v jq >/dev/null || fail "jq is needed for the licences of the package"
 cargo build -q --release --locked --target "$target" --bin usbvfiod
 binary=$CARGO_TARGET_DIR/$target/release/usbvfiod
 file -b "$binary" | grep -q 'static' || fail "$binary is not statically linked"
+! grep -q -a -F "$HOME" "$binary" || fail "$binary contains the path $HOME"
 
 log "package"
 name=usbvfiod-$version-x86_64-linux
@@ -47,9 +51,35 @@ rm -rf "$stage" && mkdir -p "$stage"
 install -m 0755 "$binary" "$stage/usbvfiod"
 install -m 0755 scripts/install.sh "$stage/install.sh"
 cp LICENSE-APACHE LICENSE-MIT "$stage/"
+cargo metadata -q --locked --format-version 1 --filter-platform "$target" \
+    | jq -r '.packages[] | [.name, .version, (.license // "see its licence files"), (.manifest_path | rtrimstr("/Cargo.toml"))] | @tsv' \
+    > "$out/packages.tsv"
+# shortcut: the Rust standard library and musl are named with a link, not with their licence texts;
+# add the texts when a package has to stand alone offline.
+{
+    echo "usbvfiod $version links these crates into its binary. Their licences follow."
+    cargo tree -q --locked -e normal --target "$target" -p usbvfiod --prefix none --format '{p}' \
+        | sed 's/ (.*//; s/ v/\t/' | sort -u | awk -F'\t' '$1 != "usbvfiod"' \
+        | while IFS=$'\t' read -r crate crate_version; do
+            IFS=$'\t' read -r _ _ licence dir \
+                < <(awk -F'\t' -v n="$crate" -v v="$crate_version" '$1 == n && $2 == v' "$out/packages.tsv")
+            printf '\n==== %s %s (%s) ====\n' "$crate" "$crate_version" "$licence"
+            found=false
+            for f in "$dir"/LICEN[CS]E* "$dir"/COPYING* "$dir"/UNLICENSE; do
+                [ -f "$f" ] || continue
+                found=true
+                printf '\n---- %s ----\n\n' "${f##*/}"
+                cat "$f"
+            done
+            $found || echo "The crate ships no licence file."
+        done
+    printf '\n==== The Rust standard library (MIT OR Apache-2.0) ====\n\n%s\n' \
+        "https://github.com/rust-lang/rust/blob/master/COPYRIGHT"
+    printf '\n==== musl libc (MIT) ====\n\n%s\n' "https://git.musl-libc.org/cgit/musl/tree/COPYRIGHT"
+} > "$stage/THIRD-PARTY-LICENSES"
 printf '%s\n' "$version" > "$stage/VERSION"
 archive=$out/$name.tar.gz
-tar -C "$out" -czf "$archive" "$name"
+tar --owner=0 --group=0 --numeric-owner -C "$out" -czf "$archive" "$name"
 
 log "dry-run install into an empty HOME"
 try=$out/try
