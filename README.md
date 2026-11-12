@@ -7,9 +7,9 @@
 > at port paths ([Hubs and Port Paths](./docs/users/hubs.md)), devices that another process serves
 > ([External Devices](./docs/users/external-devices.md)), QEMU's `vfio-user-pci` client
 > ([Using usbvfiod with QEMU](./docs/users/qemu.md)) and what Windows 11 guests need
-> ([Windows Guests](./docs/developers/windows-guests.md)). A release is a static x86_64 Linux
-> binary: `gh release download -R infinitygp/usbvfiod -p 'usbvfiod-*.tar.gz'`, unpack it and run
-> `./install.sh`, which puts it into `~/.local/bin`. To build it from source, run
+> ([Windows Guests](./docs/developers/windows-guests.md)). A release holds static x86_64 Linux
+> binaries of `usbvfiod` and `remote`: `gh release download -R infinitygp/usbvfiod -p 'usbvfiod-*.tar.gz'`, unpack it and run
+> `./install.sh`, which puts them into `~/.local/bin`. To build it from source, run
 > `cargo install --locked --git https://github.com/infinitygp/usbvfiod usbvfiod`. The changes of
 > the fork are licensed like upstream, under MIT or Apache-2.0. The rest of this README is upstream's.
 

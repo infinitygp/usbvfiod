@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Releases the fork's usbvfiod from this machine: checks, a static musl binary in
+# Releases the fork's usbvfiod from this machine: checks, static musl binaries in
 # usbvfiod-VERSION-x86_64-linux.tar.gz, a dry-run install into an empty HOME, then the tag VERSION and
 # a GitHub release with the package attached. There is no release workflow.
 # Usage: scripts/release.sh [--dry-run]   (--dry-run stops before the tag, and only notes a tag
@@ -36,19 +36,21 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test -q
 
-log "static binary ($target)"
+log "static binaries ($target)"
 rustup target list --installed | grep -qx "$target" || fail "rustup target add $target"
 command -v jq >/dev/null || fail "jq is needed for the licences of the package"
-cargo build -q --release --locked --target "$target" --bin usbvfiod
-binary=$CARGO_TARGET_DIR/$target/release/usbvfiod
-file -b "$binary" | grep -q 'static' || fail "$binary is not statically linked"
-! grep -q -a -F "$HOME" "$binary" || fail "$binary contains the path $HOME"
+cargo build -q --release --locked --target "$target" --bin usbvfiod --bin remote
+built=$CARGO_TARGET_DIR/$target/release
+for binary in "$built/usbvfiod" "$built/remote"; do
+    file -b "$binary" | grep -q 'static' || fail "$binary is not statically linked"
+    ! grep -q -a -F "$HOME" "$binary" || fail "$binary contains the path $HOME"
+done
 
 log "package"
 name=usbvfiod-$version-x86_64-linux
 stage=$out/$name
 rm -rf "$stage" && mkdir -p "$stage"
-install -m 0755 "$binary" "$stage/usbvfiod"
+install -m 0755 "$built/usbvfiod" "$built/remote" "$stage/"
 install -m 0755 scripts/install.sh "$stage/install.sh"
 cp LICENSE-APACHE LICENSE-MIT "$stage/"
 cargo metadata -q --locked --format-version 1 --filter-platform "$target" \
@@ -57,7 +59,7 @@ cargo metadata -q --locked --format-version 1 --filter-platform "$target" \
 # shortcut: the Rust standard library and musl are named with a link, not with their licence texts;
 # add the texts when a package has to stand alone offline.
 {
-    echo "usbvfiod $version links these crates into its binary. Their licences follow."
+    echo "usbvfiod $version links these crates into its binaries. Their licences follow."
     cargo tree -q --locked -e normal --target "$target" -p usbvfiod --prefix none --format '{p}' \
         | sed 's/ (.*//; s/ v/\t/' | sort -u | awk -F'\t' '$1 != "usbvfiod"' \
         | while IFS=$'\t' read -r crate crate_version; do
@@ -95,12 +97,14 @@ env -i HOME="$try/home" PATH="$try/home/.local/bin:/usr/bin:/bin" \
 server=$!
 for _ in $(seq 50); do [ -S "$try/run/S" ] && [ -S "$try/run/H" ] && break; sleep 0.2; done
 [ -S "$try/run/S" ] && [ -S "$try/run/H" ] || { kill "$server" 2>/dev/null; fail "the server opened no sockets: $(tail -3 "$try/run/log")"; }
+in_home remote --socket "$try/run/H" --tree >/dev/null || { kill "$server"; fail "remote cannot list the tree"; }
 kill -TERM "$server"
 for _ in $(seq 25); do kill -0 "$server" 2>/dev/null || break; sleep 0.2; done
 if kill -0 "$server" 2>/dev/null; then kill -KILL "$server"; fail "the server did not end on SIGTERM"; fi
 wait "$server" || true
 in_home bash "$try/unpacked/$name/install.sh" --uninstall >/dev/null
-[ ! -e "$try/home/.local/bin/usbvfiod" ] || fail "uninstall left the binary"
+[ ! -e "$try/home/.local/bin/usbvfiod" ] && [ ! -e "$try/home/.local/bin/remote" ] \
+    || fail "uninstall left a binary"
 rm -rf "$try" "$stage"
 
 if $dry; then
@@ -112,5 +116,5 @@ log "tag $tag and release"
 git tag -a "$tag" -m "usbvfiod $version"
 git push -q "$remote" "refs/tags/$tag"
 gh release create "$tag" "$archive" --repo infinitygp/usbvfiod --title "usbvfiod $version" \
-    --notes "usbvfiod $version, a fork of cyberus-technology/usbvfiod: a static x86_64 Linux binary. Install: gh release download $tag -R infinitygp/usbvfiod -p 'usbvfiod-*.tar.gz', unpack, run ./install.sh (to ~/.local/bin)."
+    --notes "usbvfiod $version, a fork of cyberus-technology/usbvfiod: static x86_64 Linux binaries of usbvfiod and remote. Install: gh release download $tag -R infinitygp/usbvfiod -p 'usbvfiod-*.tar.gz', unpack, run ./install.sh (to ~/.local/bin)."
 gh release view "$tag" --repo infinitygp/usbvfiod --json assets --jq '.assets[].name'
