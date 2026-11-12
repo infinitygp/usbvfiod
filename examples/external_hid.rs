@@ -5,7 +5,8 @@
 //!
 //! ```console
 //! $ cargo run --example external_hid -- --listen $PWD/D
-//! $ remote --socket H --external 5.1.1.4 --speed full --connect $PWD/D --name hid
+//! $ remote --socket H --hub 5 --ports 4 --speed high --vid 067b --pid 2586
+//! $ remote --socket H --external 5.1 --speed full --connect $PWD/D --name hid
 //! ```
 //!
 //! Every `remote --external` makes one device. A report is sent four times a second while the

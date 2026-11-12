@@ -71,13 +71,15 @@ $ virsh -c qemu:///session qemu-monitor-command DOMAIN '{"execute":"device_add",
 Then ask Windows, in a PowerShell of the guest:
 
 ```console
-PS> Get-PnpDevice | Where-Object { $_.InstanceId -like 'USB\*' -or $_.InstanceId -like 'PCI\VEN_1B36&DEV_000D*' } | ForEach-Object { $p = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode).Data; $loc = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_LocationPaths -ErrorAction SilentlyContinue).Data -join ' | '; '{0} | {1} | problem={2} | {3} | {4}' -f $_.FriendlyName, $_.Status, $p, $_.InstanceId, $loc }
+PS> Get-PnpDevice | Where-Object { $_.InstanceId -like 'USB\*' -or $_.InstanceId -like 'PCI\VEN_1B36&DEV_000D*' } | ForEach-Object { $p = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_ProblemCode).Data; $loc = (Get-PnpDeviceProperty -InstanceId $_.InstanceId -KeyName DEVPKEY_Device_LocationPaths -ErrorAction SilentlyContinue).Data -join ' | '; '{0} | {1} | present={5} | problem={2} | {3} | {4}' -f $_.FriendlyName, $_.Status, $p, $_.InstanceId, $loc, $_.Present }
 ```
 
 The controller is "Standard USB 3.20 eXtensible Host Controller - 1.0 (Microsoft)" with status OK and
 problem code 0, and its root hub "USB Root Hub (USB 3.0)" has status OK. The guest also has the
 controller of QEMU itself, `qemu-xhci`, which the same driver accepts: compare against it when
-something is wrong. Its source is in `hw/usb/hcd-xhci*.c` of QEMU.
+something is wrong. Its source is in `hw/usb/hcd-xhci*.c` of QEMU. Both controllers have the PCI
+IDs `1B36:000D`; the location path, which starts at the PCIe root port given as `bus`, tells them
+apart.
 
 More diagnostics:
 
@@ -106,10 +108,14 @@ follows (`Present` is False, then True again, with status OK).
 
 An external device (see [External Devices](../users/external-devices.md)) needs no hardware either.
 `examples/external_hid.rs` serves a full speed HID with USB 1.10 and 8 bytes for endpoint 0 on a
-unix socket; `remote --external` below the hubs of a tree attaches it:
+unix socket. Run it from a checkout of usbvfiod (`CHECKOUT`); `remote --external` below the hubs
+of a tree attaches it:
 
 ```console
-$ cargo run --example external_hid -- --listen $PWD/D &
+$ cargo run --manifest-path CHECKOUT/Cargo.toml --example external_hid -- --listen $PWD/D &
+$ remote --socket H --hub 5 --ports 4 --speed high --vid 067b --pid 2586
+$ remote --socket H --hub 5.1 --ports 4 --speed high --vid 067b --pid 2586
+$ remote --socket H --hub 5.1.1 --ports 4 --speed high --vid 067b --pid 2586
 $ remote --socket H --external 5.1.1.4 --speed full --connect $PWD/D --name hid
 ```
 

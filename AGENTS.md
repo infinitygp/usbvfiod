@@ -25,7 +25,7 @@ $ cargo clippy --all-targets -- -D warnings
 $ cargo test
 ```
 
-All three checks must pass without warnings before a commit. They are what upstream's `flake.nix`
+The checks after `cargo build` must pass without warnings before a commit. They are what upstream's `flake.nix`
 runs (`nix flake check` also runs nextest, rustdoc, the dependency audits, formatters for Nix and
 TOML and the NixOS VM tests under `nix/checks`, which need Cloud Hypervisor). The unit tests need
 no device, no VM and no network.
@@ -47,7 +47,7 @@ no device, no VM and no network.
    and problem code 0.
 
 No hardware at hand, or no device to risk? The ignored test `serve_a_virtual_hid_to_a_guest`
-(`src/device/xhci/virtual_hid.rs`) serves a virtual full speed HID device with a vendor defined
+(`src/xhci_backend.rs`, the device is in `src/device/xhci/virtual_hid.rs`) serves a virtual full speed HID device with a vendor defined
 report that sends 4 reports per second, instead of `usbvfiod`:
 
 ```console
@@ -63,8 +63,8 @@ seconds. Windows lists it as `USB\VID_1209&PID_DE00\0001`.
 ## Release
 
 The version is upstream's with the suffix `-fork.N` (`0.4.0-fork.1`), so `usbvfiod --version` tells
-the fork from upstream. The package is `usbvfiod-VERSION-x86_64-linux.tar.gz`: a static musl binary,
-which runs on any x86_64 Linux, `install.sh`, the licences of usbvfiod and `THIRD-PARTY-LICENSES`
+the fork from upstream. The package is `usbvfiod-VERSION-x86_64-linux.tar.gz`: static musl binaries of
+`usbvfiod` and `remote`, which run on any x86_64 Linux, `install.sh`, the licences of usbvfiod and `THIRD-PARTY-LICENSES`
 with those of the crates in the binary. Others download the newest release by the repository name
 and the pattern `usbvfiod-*.tar.gz`, so keep both, and publish a release as the latest, not as a
 prerelease. Releases are made locally and run the whole chain without stopping between steps:
@@ -76,11 +76,11 @@ prerelease. Releases are made locally and run the whole chain without stopping b
    existing tag (the release refuses it), runs the checks under "Build and test", builds the static
    binary without the paths of the home directory, packs it with the licences, installs it into an
    empty `HOME`, checks `usbvfiod --version` and that the server opens its sockets, and uninstalls
-   it. It needs `rustup target add x86_64-unknown-linux-musl`, `gh` and `jq`.
+   it. It needs `rustup target add x86_64-unknown-linux-musl`, `file`, `jq` and `gh`.
 3. Run `scripts/release.sh`. It repeats step 2, then tags `VERSION` (no `v` prefix), pushes the tag
    and creates the GitHub release with the package attached.
 4. Install it: `gh release download VERSION -R infinitygp/usbvfiod -p 'usbvfiod-*.tar.gz'`, unpack,
-   and run `./install.sh` (into `~/.local/bin`).
+   and run `./install.sh` (both binaries into `~/.local/bin`).
 
 ## Hubs and port paths
 
@@ -90,7 +90,7 @@ the hub on root port R, up to five hubs deep (`docs/users/hubs.md`). The hotplug
 with `remote`:
 
 ```console
-$ remote --socket H --hub 5 --ports 4 --speed high --descriptors hub.hex --product "USB 2.0 Hub"
+$ remote --socket H --hub 5 --ports 4 --speed high --descriptors hub.hex --product "USB 2.0 Hub"   # hex text, docs/users/hubs.md
 $ remote --socket H --virtual-hid 5.1.4 --speed full
 $ remote --socket H --attach-at 5.1.4 --device /dev/bus/usb/BBB/DDD   # a host device, see below
 $ remote --socket H --external 5.1.4 --speed full --connect D --name N   # a device server, docs/users/external-devices.md
@@ -111,9 +111,10 @@ a hub subtree and the top hub again: `Present` goes False and True again.
 Things to know:
 
 - QEMU 11.1.3 aborts the whole VM when the server dies (`error_setv: Assertion '*errp == NULL'`) and
-  when the device is removed with `device_del` (assertion in `vfio_user_msix_teardown`). That is not
-  a bug of this repository; start a fresh guest instead of hot-removing. `pkill -f` on the usbvfiod
-  command line also matches the shell that runs it: kill by PID.
+  when the device is removed with `device_del` (a `memory_region_del_subregion` assertion in the
+  MSI-X teardown). That is not a bug of this repository; start a fresh guest instead of
+  hot-removing. `pkill -f` on the usbvfiod command line also matches the shell that runs it: kill by
+  PID.
 - QEMU's own `qemu-xhci` controller is accepted by the same Windows driver. Its source
   (`hw/usb/hcd-xhci*.c`) is the reference when Windows rejects something of ours.
 - The check of the unit tests does not replace the check in the guest, and the other way round.

@@ -26,8 +26,8 @@ the device `5.1.1.4` on the first controller of the guest is
 
 ## Commands
 
-All commands go through the hotplug socket of `usbvfiod` (`--hotplug-socket-path`) with the
-`remote` binary. A hub has to exist before a device is attached below it. Detaching a hub detaches
+All commands go through the hotplug socket of `usbvfiod` (`--hotplug-socket-path`, `H` in the
+examples) with the `remote` binary. A hub has to exist before a device is attached below it. Detaching a hub detaches
 everything below it.
 
 ```console
