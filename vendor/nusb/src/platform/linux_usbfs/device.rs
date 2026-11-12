@@ -1,3 +1,4 @@
+// Changed for usbvfiod: a control transfer whose future is dropped is cancelled (vendor/README.md).
 use std::{
     collections::{BTreeMap, VecDeque},
     ffi::c_void,
