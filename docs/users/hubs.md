@@ -146,8 +146,6 @@ times, no port indicators, all devices removable, 100 ms from power-on to power 
 - Hubs are USB 2.0 hubs. There are no USB 3 hubs and no SuperSpeed devices below a hub.
 - A device below a hub can be full speed or high speed. The hub reports the low speed bit for a
   low speed device of the host, which has not been tried.
-- The USB device address in the output slot context is not set, so tools that read it (USBView)
-  show address 0.
 - A write of `PORTSC.PLS = U3` is ignored for ports of USB 3 and for root ports without a hub.
   The same holds for a downstream port of a hub with a device that is not a hub (a device of the
   host or an external device): `SET_PORT_FEATURE(PORT_SUSPEND)` succeeds, and the port status
